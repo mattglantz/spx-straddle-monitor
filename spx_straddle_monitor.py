@@ -807,6 +807,19 @@ app.layout = dbc.Container([
         ], style={**CARD_STYLE, "padding": "16px 20px"}), width=2),
     ], className="mb-4 g-3"),
 
+    # Refresh button — top right above Events card
+    dbc.Row([
+        dbc.Col(
+            html.Button("⟳ Refresh", id="refresh-btn",
+                        style={"background": "#21262d", "color": "#8b949e", "border": "1px solid #30363d",
+                               "borderRadius": "6px", "padding": "6px 16px", "cursor": "pointer",
+                               "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px",
+                               "fontWeight": "600", "letterSpacing": "0.5px"}),
+            width="auto",
+            style={"textAlign": "right"},
+        ),
+    ], justify="end", className="mb-2"),
+
     # Data Table
     dbc.Row([dbc.Col([
         html.Div([
@@ -843,6 +856,16 @@ app.layout = dbc.Container([
 # ============================================================
 # CALLBACKS
 # ============================================================
+
+@app.callback(
+    Output('update-interval', 'n_intervals'),
+    [Input('refresh-btn', 'n_clicks')],
+    prevent_initial_call=True,
+)
+def manual_refresh(n_clicks):
+    """Bump interval counter to trigger an immediate dashboard update."""
+    return (n_clicks or 0) + 10000
+
 
 @app.callback(
     [
