@@ -586,22 +586,28 @@ def build_term_structure_chart(df):
 
 
 def build_straddle_history_chart(history):
-    # Generate full time axis from 6:00 AM to 5:00 PM ET
-    time_slots = [f"{h}:{m:02d}" for h in range(6, 17) for m in (0, 30)]
-    time_slots.append("17:00")
+    # Fixed time range: 6:00 AM – 5:00 PM ET using today's date
+    today = datetime.now(ET).date()
+    range_start = datetime(today.year, today.month, today.day, 6, 0)
+    range_end = datetime(today.year, today.month, today.day, 17, 0)
 
     if not history:
         fig = go.Figure()
         fig.update_layout(**CHART_LAYOUT, title="Intraday Straddle Decay (waiting for data)",
-                          xaxis=dict(categoryorder='array', categoryarray=time_slots))
+                          xaxis=dict(range=[range_start, range_end],
+                                     tickformat="%H:%M", dtick=3600000))
         return fig
     df_hist = pd.DataFrame(history)
+    # Convert "HH:MM" timestamps to full datetime for proper time axis
+    df_hist["time"] = df_hist["timestamp"].apply(
+        lambda t: datetime(today.year, today.month, today.day,
+                           int(t.split(":")[0]), int(t.split(":")[1])))
     fig = go.Figure()
     for dte_val in sorted(df_hist["dte"].unique()):
         subset = df_hist[df_hist["dte"] == dte_val]
         label = f"{int(dte_val)}DTE ({subset.iloc[0]['expiry']})"
         fig.add_trace(go.Scatter(
-            x=subset["timestamp"], y=subset["price"],
+            x=subset["time"], y=subset["price"],
             mode='lines+markers', name=label,
             line=dict(color='#58a6ff', width=2),
             marker=dict(size=5),
@@ -611,7 +617,8 @@ def build_straddle_history_chart(history):
         title="Intraday Straddle Decay (1DTE)",
         xaxis_title="Time (ET)",
         yaxis_title="Straddle Price ($)",
-        xaxis=dict(categoryorder='array', categoryarray=time_slots),
+        xaxis=dict(range=[range_start, range_end],
+                   tickformat="%H:%M", dtick=3600000),
         yaxis=dict(tickprefix="$"),
     )
     return fig
