@@ -867,26 +867,16 @@ app.layout = dbc.Container([
                             "fontFamily": "JetBrains Mono, monospace"}),
         ], style={**CARD_STYLE, "padding": "16px 20px"}), width=2),
 
-        # Events
+        # Refresh
         dbc.Col(html.Div([
-            html.Div("EVENTS", style=CARD_LABEL),
-            html.Div(id="today-events-display",
-                     style={**CARD_VALUE, "fontSize": "16px", "color": "#d29922"}),
-        ], style={**CARD_STYLE, "padding": "16px 20px"}), width=2),
-    ], className="mb-4 g-3"),
-
-    # Refresh button — top right above Events card
-    dbc.Row([
-        dbc.Col(
-            html.Button("⟳ Refresh", id="refresh-btn",
+            html.Button("⟳  Refresh", id="refresh-btn",
                         style={"background": "#21262d", "color": "#8b949e", "border": "1px solid #30363d",
-                               "borderRadius": "6px", "padding": "6px 16px", "cursor": "pointer",
-                               "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "13px",
-                               "fontWeight": "600", "letterSpacing": "0.5px"}),
-            width="auto",
-            style={"textAlign": "right"},
-        ),
-    ], justify="end", className="mb-2"),
+                               "borderRadius": "6px", "padding": "10px 24px", "cursor": "pointer",
+                               "fontFamily": "IBM Plex Sans, sans-serif", "fontSize": "14px",
+                               "fontWeight": "600", "letterSpacing": "0.5px", "width": "100%"}),
+        ], style={**CARD_STYLE, "padding": "16px 20px",
+                  "display": "flex", "alignItems": "center", "justifyContent": "center"}), width=2),
+    ], className="mb-4 g-3"),
 
     # Data Table
     dbc.Row([dbc.Col([
@@ -937,7 +927,6 @@ app.layout = dbc.Container([
         Output('vix-change-display', 'children'),
         Output('status-display', 'children'),
         Output('time-display', 'children'),
-        Output('today-events-display', 'children'),
         Output('term-structure-chart', 'figure'),
         Output('straddle-history-chart', 'figure'),
     ],
@@ -1004,15 +993,6 @@ def update_dashboard(n, n_clicks):
         vix_change_display = html.Span("-", style={"color": "#484f58",
                                                      "fontFamily": "JetBrains Mono, monospace"})
 
-    today_evts, tomorrow_evts = get_upcoming_events()
-    event_parts = []
-    if today_evts:
-        event_parts.append(html.Div(f"Today: {' / '.join(today_evts)}"))
-    if tomorrow_evts:
-        event_parts.append(html.Div(f"Tmrw: {' / '.join(tomorrow_evts)}",
-                                    style={"color": "#8b949e", "fontSize": "14px"}))
-    today_events_text = event_parts if event_parts else "No events"
-
     fig_term = build_term_structure_chart(df)
     fig_history = build_straddle_history_chart(straddle_history)
 
@@ -1027,7 +1007,6 @@ def update_dashboard(n, n_clicks):
         vix_change_display,
         status,
         f"Updated: {last_update}",
-        today_events_text,
         fig_term,
         fig_history,
     )
