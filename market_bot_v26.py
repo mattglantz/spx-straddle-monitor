@@ -1150,6 +1150,7 @@ def main():
                     contracts=contracts,
                     trade_taken=verdict not in ("FLAT", "NEUTRAL") and conf >= flat_threshold,
                     trade_id=_new_trade_id,
+                    confluence_override=decomposition.get("confluence_override", False),
                 )
             except Exception as e:
                 logger.warning(f"Signal logger error: {e}")
