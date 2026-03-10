@@ -462,9 +462,10 @@ async def ib_loop():
 
                     table_data.sort(key=lambda r: r["DTE"])
 
-                    # Collect straddle history for intraday decay chart (1DTE only)
-                    if is_regular_session():
-                        ts = datetime.now(ET).strftime("%H:%M")
+                    # Collect straddle history for intraday decay chart (1DTE only, 6AM-5PM ET)
+                    now_et = datetime.now(ET)
+                    if now_et.weekday() < 5 and time(6, 0) <= now_et.time() <= time(17, 0):
+                        ts = now_et.strftime("%H:%M")
                         with state_lock:
                             for row in table_data:
                                 if row["DTE"] == 1 and row["Straddle Price"] > 0:
@@ -585,27 +586,32 @@ def build_term_structure_chart(df):
 
 
 def build_straddle_history_chart(history):
+    # Generate full time axis from 6:00 AM to 5:00 PM ET
+    time_slots = [f"{h}:{m:02d}" for h in range(6, 17) for m in (0, 30)]
+    time_slots.append("17:00")
+
     if not history:
         fig = go.Figure()
-        fig.update_layout(**CHART_LAYOUT, title="Intraday Straddle Decay (waiting for data)")
+        fig.update_layout(**CHART_LAYOUT, title="Intraday Straddle Decay (waiting for data)",
+                          xaxis=dict(categoryorder='array', categoryarray=time_slots))
         return fig
     df_hist = pd.DataFrame(history)
     fig = go.Figure()
     for dte_val in sorted(df_hist["dte"].unique()):
         subset = df_hist[df_hist["dte"] == dte_val]
         label = f"{int(dte_val)}DTE ({subset.iloc[0]['expiry']})"
-        color = '#f47067' if dte_val == 0 else '#58a6ff'
         fig.add_trace(go.Scatter(
             x=subset["timestamp"], y=subset["price"],
             mode='lines+markers', name=label,
-            line=dict(color=color, width=2),
+            line=dict(color='#58a6ff', width=2),
             marker=dict(size=5),
         ))
     fig.update_layout(
         **CHART_LAYOUT,
-        title="Intraday Straddle Decay (0-1 DTE)",
+        title="Intraday Straddle Decay (1DTE)",
         xaxis_title="Time (ET)",
         yaxis_title="Straddle Price ($)",
+        xaxis=dict(categoryorder='array', categoryarray=time_slots),
         yaxis=dict(tickprefix="$"),
     )
     return fig
