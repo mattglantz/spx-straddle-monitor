@@ -926,16 +926,6 @@ app.layout = dbc.Container([
 # ============================================================
 
 @app.callback(
-    Output('update-interval', 'n_intervals'),
-    [Input('refresh-btn', 'n_clicks')],
-    prevent_initial_call=True,
-)
-def manual_refresh(n_clicks):
-    """Bump interval counter to trigger an immediate dashboard update."""
-    return (n_clicks or 0) + 10000
-
-
-@app.callback(
     [
         Output('live-table', 'data'),
         Output('spot-display', 'children'),
@@ -951,9 +941,10 @@ def manual_refresh(n_clicks):
         Output('term-structure-chart', 'figure'),
         Output('straddle-history-chart', 'figure'),
     ],
-    [Input('update-interval', 'n_intervals')],
+    [Input('update-interval', 'n_intervals'),
+     Input('refresh-btn', 'n_clicks')],
 )
-def update_dashboard(n):
+def update_dashboard(n, n_clicks):
     with state_lock:
         df = shared_state["df"].copy()
         spot = shared_state["spot_price"]
