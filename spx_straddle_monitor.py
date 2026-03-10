@@ -465,6 +465,10 @@ async def ib_loop():
                     if changed:
                         with state_lock:
                             shared_state["status"] = f"Switched to {target_strike}"
+                            # Strike moved — clear open straddles so decay
+                            # recaptures at the new ATM strike
+                            shared_state["open_straddles"] = {}
+                            log.info("Strike changed — reset open straddles for decay tracking")
 
                     # Build table rows
                     table_data = []
