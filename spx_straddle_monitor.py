@@ -594,7 +594,7 @@ def build_straddle_history_chart(history):
     if not history:
         fig = go.Figure()
         fig.update_layout(**CHART_LAYOUT, title="Intraday Straddle Decay (waiting for data)",
-                          xaxis=dict(range=[range_start, range_end],
+                          xaxis=dict(range=[range_start, range_end], autorange=False,
                                      tickformat="%H:%M", dtick=3600000))
         return fig
     df_hist = pd.DataFrame(history)
@@ -617,7 +617,7 @@ def build_straddle_history_chart(history):
         title="Intraday Straddle Decay (1DTE)",
         xaxis_title="Time (ET)",
         yaxis_title="Straddle Price ($)",
-        xaxis=dict(range=[range_start, range_end],
+        xaxis=dict(range=[range_start, range_end], autorange=False,
                    tickformat="%H:%M", dtick=3600000),
         yaxis=dict(tickprefix="$"),
     )
