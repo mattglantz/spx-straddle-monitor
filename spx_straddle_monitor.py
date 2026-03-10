@@ -15,8 +15,10 @@ from plotly.subplots import make_subplots
 from datetime import datetime, date, time, timedelta
 import math
 from zoneinfo import ZoneInfo
+import sqlite3
 import logging
 import webbrowser
+from pathlib import Path
 from ib_async import IB, Index, Option, ContFuture
 
 # ============================================================
@@ -113,8 +115,68 @@ log = logging.getLogger(__name__)
 logging.getLogger('ib_async').setLevel(logging.ERROR)
 
 # ============================================================
+# STRADDLE HISTORY DB (persists across restarts)
+# ============================================================
+HISTORY_DB = Path(__file__).parent / "straddle_history.db"
+
+
+def _init_history_db():
+    with sqlite3.connect(HISTORY_DB) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS straddle_history (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                session   TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                dte       INTEGER NOT NULL,
+                price     REAL NOT NULL,
+                expiry    TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sh_session "
+            "ON straddle_history(session)"
+        )
+        conn.commit()
+
+
+_init_history_db()
+
+
+def save_history_point(session_date, ts, dte, price, expiry):
+    """Persist one straddle data point."""
+    try:
+        with sqlite3.connect(HISTORY_DB) as conn:
+            conn.execute(
+                "INSERT INTO straddle_history (session, timestamp, dte, price, expiry) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_date, ts, dte, price, expiry),
+            )
+            conn.commit()
+    except Exception:
+        log.exception("Failed to save history point")
+
+
+def load_history_for_date(session_date):
+    """Load all straddle history rows for a given date."""
+    try:
+        with sqlite3.connect(HISTORY_DB) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT timestamp, dte, price, expiry FROM straddle_history "
+                "WHERE session = ? ORDER BY id",
+                (session_date,),
+            ).fetchall()
+        return [{"timestamp": r["timestamp"], "dte": r["dte"],
+                 "price": r["price"], "expiry": r["expiry"]} for r in rows]
+    except Exception:
+        log.exception("Failed to load history")
+        return []
+
+
+# ============================================================
 # SHARED STATE
 # ============================================================
+_today_str = datetime.now(ET).strftime("%Y-%m-%d")
 shared_state = {
     "df": pd.DataFrame(),
     "spot_price": 0.0,
@@ -127,8 +189,9 @@ shared_state = {
     "prior_close": None,
     "vix_price": 0.0,
     "vix_prior_close": None,
-    "straddle_history": [],
+    "straddle_history": load_history_for_date(_today_str),
 }
+log.info(f"Loaded {len(shared_state['straddle_history'])} history points for {_today_str}")
 state_lock = threading.Lock()
 
 # ============================================================
@@ -410,7 +473,8 @@ async def ib_loop():
                             shared_state["session_date"] = today
                             shared_state["session_open_spot"] = None
                             shared_state["prior_close"] = None
-                            shared_state["straddle_history"] = []
+                            shared_state["straddle_history"] = load_history_for_date(
+                                today.strftime("%Y-%m-%d"))
 
                     # Refresh expiries
                     if (now - last_expiry_refresh) > timedelta(minutes=EXPIRY_REFRESH_MINUTES):
@@ -466,15 +530,19 @@ async def ib_loop():
                     now_et = datetime.now(ET)
                     if now_et.weekday() < 5 and time(6, 0) <= now_et.time() <= time(17, 0):
                         ts = now_et.strftime("%H:%M")
+                        session_str = now_et.strftime("%Y-%m-%d")
                         with state_lock:
                             for row in table_data:
                                 if row["DTE"] == 1 and row["Straddle Price"] > 0:
-                                    shared_state["straddle_history"].append({
+                                    point = {
                                         "timestamp": ts,
                                         "dte": row["DTE"],
                                         "price": row["Straddle Price"],
                                         "expiry": row["Expiry"],
-                                    })
+                                    }
+                                    shared_state["straddle_history"].append(point)
+                                    save_history_point(session_str, ts, row["DTE"],
+                                                       row["Straddle Price"], row["Expiry"])
 
                     # VIX price
                     vix_last = safe_float(vix_ticker.last)
