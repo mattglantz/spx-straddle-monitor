@@ -462,12 +462,12 @@ async def ib_loop():
 
                     table_data.sort(key=lambda r: r["DTE"])
 
-                    # Collect straddle history for intraday decay chart (0-1 DTE)
+                    # Collect straddle history for intraday decay chart (1DTE only)
                     if is_regular_session():
                         ts = datetime.now(ET).strftime("%H:%M")
                         with state_lock:
                             for row in table_data:
-                                if row["DTE"] <= 1 and row["Straddle Price"] > 0:
+                                if row["DTE"] == 1 and row["Straddle Price"] > 0:
                                     shared_state["straddle_history"].append({
                                         "timestamp": ts,
                                         "dte": row["DTE"],
@@ -774,7 +774,6 @@ app.layout = dbc.Container([
                      style={**CARD_VALUE, "fontSize": "32px"}),
             html.Div(id="vix-change-display",
                      style={**CARD_VALUE, "fontSize": "18px", "marginTop": "4px"}),
-            html.Div(id="vol-premium-display", style={"marginTop": "6px"}),
         ], style={**CARD_STYLE, "padding": "16px 20px"}), width=3),
 
         # Status
@@ -842,7 +841,6 @@ app.layout = dbc.Container([
         Output('session-open-display', 'children'),
         Output('vix-display', 'children'),
         Output('vix-change-display', 'children'),
-        Output('vol-premium-display', 'children'),
         Output('status-display', 'children'),
         Output('time-display', 'children'),
         Output('today-events-display', 'children'),
@@ -911,37 +909,6 @@ def update_dashboard(n):
         vix_change_display = html.Span("-", style={"color": "#484f58",
                                                      "fontFamily": "JetBrains Mono, monospace"})
 
-    # Vol premium: 0DTE ATM IV vs VIX
-    vol_premium_display = ""
-    if not df.empty and vix > 0:
-        dte0_rows = df[df["DTE"] == 0]
-        if not dte0_rows.empty:
-            atm_iv = dte0_rows.iloc[0]["IV"]
-            if atm_iv > 0:
-                atm_iv_pct = atm_iv * 100
-                premium = atm_iv_pct - vix
-                ratio = atm_iv_pct / vix
-                if premium > 5:
-                    prem_color, prem_label = "#3fb950", "RICH"
-                elif premium > 0:
-                    prem_color, prem_label = "#d29922", "FAIR+"
-                elif premium > -5:
-                    prem_color, prem_label = "#8b949e", "FAIR"
-                else:
-                    prem_color, prem_label = "#f47067", "CHEAP"
-                vol_premium_display = html.Div([
-                    html.Span("VOL PREM ", style={"fontSize": "10px", "color": "#484f58",
-                                                    "textTransform": "uppercase",
-                                                    "letterSpacing": "0.5px"}),
-                    html.Span(f"{ratio:.2f}x ",
-                              style={"fontSize": "16px", "color": prem_color,
-                                     "fontWeight": "700",
-                                     "fontFamily": "JetBrains Mono, monospace"}),
-                    html.Span(prem_label,
-                              style={"fontSize": "12px", "color": prem_color,
-                                     "fontWeight": "700"}),
-                ], style={"marginTop": "4px"})
-
     today_evts, tomorrow_evts = get_upcoming_events()
     event_parts = []
     if today_evts:
@@ -963,7 +930,6 @@ def update_dashboard(n):
         session_open_display,
         vix_display,
         vix_change_display,
-        vol_premium_display,
         status,
         f"Updated: {last_update}",
         today_events_text,
