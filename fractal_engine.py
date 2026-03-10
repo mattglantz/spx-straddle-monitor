@@ -610,9 +610,10 @@ class OutcomeTracker:
 
     def record_actual(self, actual_dir, move_pts):
         """
-        FIX v2.1: was_correct now compares actual_dir to the stored predicted_dir
-        per row. Previous code checked (actual_dir != "FLAT") which marked any
-        trending day as correct regardless of whether the prediction matched.
+        FIX v2.3: was_correct uses direction-based matching, not exact string.
+        "LEAN BULLISH" predicted + "BULLISH" actual = correct (both bullish).
+        Previous v2.1 required exact string match which caused LEAN signals
+        to always score 0%.
         """
         today = now_et().strftime("%Y-%m-%d")
         with self._conn() as conn:
@@ -621,9 +622,12 @@ class OutcomeTracker:
                 "WHERE today_date=? AND actual_dir IS NULL",
                 (today,)).fetchall()
             for row in rows:
+                pred = row["predicted_dir"] or ""
                 was_correct = int(
                     actual_dir not in ("FLAT", "NEUTRAL") and
-                    actual_dir == row["predicted_dir"]
+                    pred not in ("FLAT", "NEUTRAL", "NEUTRAL / CHOP", "") and
+                    (("BULL" in actual_dir and "BULL" in pred) or
+                     ("BEAR" in actual_dir and "BEAR" in pred))
                 )
                 conn.execute(
                     "UPDATE fractal_outcomes SET actual_dir=?, was_correct=?, move_pts=? WHERE id=?",
@@ -631,9 +635,18 @@ class OutcomeTracker:
             conn.commit()
 
     def get_day_bonus(self, match_date):
+        """
+        FIX v2.3: Per-day accuracy instead of per-row.
+        Previously, a day with 1591 match rows counted 1591x vs a day with
+        2 rows counting 2x. Now we deduplicate by today_date so each
+        prediction day counts once regardless of how many matches it had.
+        """
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT was_correct FROM fractal_outcomes WHERE match_date=? AND actual_dir IS NOT NULL",
+                "SELECT today_date, MAX(was_correct) as was_correct "
+                "FROM fractal_outcomes "
+                "WHERE match_date=? AND actual_dir IS NOT NULL "
+                "GROUP BY today_date",
                 (str(match_date),)).fetchall()
         if len(rows) < 3: return 0.0
         rate = sum(r["was_correct"] for r in rows) / len(rows)

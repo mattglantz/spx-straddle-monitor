@@ -521,6 +521,29 @@ def main():
                     realized, floating = audit_open_trades(journal, md)
                 last_eod_close = now
 
+                # Record fractal outcome using actual market direction (open→close),
+                # not trade P&L. This eliminates selection bias from only recording
+                # on trade closes and removes bullish trade bias from actuals.
+                try:
+                    _today_1m = md.es_today_1m
+                    if not _today_1m.empty and len(_today_1m) >= 10:
+                        _mkt_open = float(_today_1m["Open"].iloc[0])
+                        _mkt_close = float(_today_1m["Close"].iloc[-1])
+                        _mkt_move = _mkt_close - _mkt_open
+                        if abs(_mkt_move) < 1.0:
+                            _mkt_dir = "FLAT"
+                        elif _mkt_move > 0:
+                            _mkt_dir = "BULLISH"
+                        else:
+                            _mkt_dir = "BEARISH"
+                        fractal_engine.record_outcome(_mkt_dir, _mkt_move)
+                        logger.info(
+                            f"EOD fractal outcome: {_mkt_dir} ({_mkt_move:+.2f} pts) "
+                            f"[open={_mkt_open:.2f} close={_mkt_close:.2f}]"
+                        )
+                except Exception as e:
+                    logger.warning(f"EOD fractal outcome recording error: {e}")
+
             # 3. Daily loss limit -- includes floating P&L for true risk picture (#1)
             today_stats = journal.get_today_stats()
             realized_dollars = today_stats['realized'] * CFG.POINT_VALUE
@@ -560,45 +583,19 @@ def main():
             session = get_session_phase()
             prev_verdict = journal.get_last_verdict()
 
-            # Record fractal outcome from the most recently closed trade.
-            # Previously used (current_price - open_entry) which was wrong:
-            # (a) recorded every 10-min cycle, not once at close
-            # (b) a 15-min pullback before a 30-pt rally got recorded as BEARISH
-            # Now: only record when a trade actually closes, use final P&L direction.
+            # Mark closed trades as recorded (outcome recording moved to EOD
+            # block above — uses actual market direction open→close, not trade P&L,
+            # to eliminate selection bias and bullish trade bias).
             try:
                 with journal._conn() as _jconn:
-                    _all_closed = _jconn.execute(
-                        "SELECT id, verdict, pnl, price FROM trades "
+                    _jconn.execute(
+                        f"UPDATE trades SET fractal_recorded=1 "
                         f"WHERE status IN {ts.DECIDED_SQL} "
-                        "AND fractal_recorded IS NULL ORDER BY id ASC"
-                    ).fetchall()
-                    for _closed in _all_closed:
-                        _pnl = float(_closed["pnl"])
-                        _verdict = str(_closed["verdict"]).upper()
-                        _entry = float(_closed["price"])
-                        # Convert P&L to market move direction:
-                        # Bullish win (+5 pts) = market moved UP +5
-                        # Bearish win (+5 pts) = market moved DOWN -5
-                        if "BEAR" in _verdict:
-                            _move = -_pnl  # invert: bearish profit means market fell
-                        else:
-                            _move = _pnl   # bullish profit means market rose
-                        # Actual direction = which way did the market actually move?
-                        if "BULL" in _verdict:
-                            _actual = "BULLISH" if _pnl > 0 else "BEARISH"
-                        elif "BEAR" in _verdict:
-                            _actual = "BEARISH" if _pnl > 0 else "BULLISH"
-                        else:
-                            _actual = "FLAT"
-                        fractal_engine.record_outcome(_actual, _move)
-                        _jconn.execute(
-                            "UPDATE trades SET fractal_recorded=1 WHERE id=?",
-                            (_closed["id"],)
-                        )
-                    if _all_closed:
-                        _jconn.commit()
+                        "AND fractal_recorded IS NULL"
+                    )
+                    _jconn.commit()
             except Exception as e:
-                logger.warning(f"Fractal recording error: {e}")
+                logger.warning(f"Fractal recorded flag update error: {e}")
 
             # opening_type needed by fractal engine -- compute before analyze()
             opening_type = classify_opening_type(md, initial_balance)
