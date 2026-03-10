@@ -96,7 +96,7 @@ def get_events_on_date(expiry_str):
 
 
 def get_upcoming_events():
-    today = datetime.now().date()
+    today = datetime.now(ET).date()
     tomorrow = today + timedelta(days=1)
     today_str = today.strftime('%Y-%m-%d')
     tomorrow_str = tomorrow.strftime('%Y-%m-%d')
@@ -124,7 +124,6 @@ shared_state = {
     "last_update": datetime.now().strftime("%H:%M:%S"),
     "session_open_spot": None,
     "session_date": None,
-    "open_straddles": {},
     "prior_close": None,
     "vix_price": 0.0,
     "vix_prior_close": None,
@@ -153,7 +152,7 @@ def get_nearest_strike(price, step=STRIKE_STEP):
 
 def calc_dte(expiry_str):
     exp_date = datetime.strptime(expiry_str, '%Y%m%d').date()
-    return max((exp_date - datetime.now().date()).days, 0)
+    return max((exp_date - datetime.now(ET).date()).days, 0)
 
 
 def calc_wing_offset(spot, annual_vol, dte, strike_step=STRIKE_STEP):
@@ -205,7 +204,7 @@ async def get_next_n_spxw_expiries(ib, contract, n=NUM_EXPIRIES):
     for chain in spxw_chains:
         all_expirations.update(chain.expirations)
     sorted_exp = sorted(all_expirations)
-    today_str = datetime.now().strftime('%Y%m%d')
+    today_str = datetime.now(ET).strftime('%Y%m%d')
     future_exps = [e for e in sorted_exp
                     if e >= today_str and datetime.strptime(e, '%Y%m%d').weekday() < 5][:n]
     trading_class = spxw_chains[0].tradingClass if spxw_chains else 'SPX'
@@ -315,17 +314,15 @@ def compute_spot(spx_ticker, es_ticker):
 # BUILD TABLE ROW
 # ============================================================
 
-def build_row(expiry, strike, call_ticker, put_ticker, cur_spot, wing_data=None, open_straddle=0):
+def build_row(expiry, strike, call_ticker, put_ticker, cur_spot, wing_data=None):
     cb, ca, cm = safe_bid_ask(call_ticker)
     pb, pa, pm = safe_bid_ask(put_ticker)
     straddle_price = cm + pm
 
-    c_iv, c_gamma, c_theta = get_greeks(call_ticker)
-    p_iv, p_gamma, p_theta = get_greeks(put_ticker)
+    c_iv = get_greeks(call_ticker)[0]
+    p_iv = get_greeks(put_ticker)[0]
 
     avg_iv = (c_iv + p_iv) / 2 if (c_iv > 0 and p_iv > 0) else (c_iv or p_iv)
-    straddle_gamma = c_gamma + p_gamma
-    straddle_theta = c_theta + p_theta
 
     dte = calc_dte(expiry)
     exp_fmt = f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:]}"
@@ -334,19 +331,6 @@ def build_row(expiry, strike, call_ticker, put_ticker, cur_spot, wing_data=None,
     impl_move_pct = (straddle_price / cur_spot * 100) if (cur_spot > 0 and straddle_price > 0) else 0
     # Implied move in SPX points (85% expected move rule)
     impl_move_pts = straddle_price * 0.85 if straddle_price > 0 else 0
-
-    # Breakeven points
-    if straddle_price > 0 and strike > 0:
-        breakevens = f"{strike - straddle_price:.0f} / {strike + straddle_price:.0f}"
-    else:
-        breakevens = "-"
-
-    # Straddle decay from session open
-    decay_dollars = 0.0
-    decay_pct = 0.0
-    if open_straddle > 0 and straddle_price > 0:
-        decay_dollars = open_straddle - straddle_price
-        decay_pct = (decay_dollars / open_straddle) * 100
 
     # P/C Skew: 25-delta risk reversal (OTM put IV - OTM call IV)
     # Positive = puts vol richer than calls (normal equity skew)
@@ -368,15 +352,10 @@ def build_row(expiry, strike, call_ticker, put_ticker, cur_spot, wing_data=None,
         "Call Bid/Ask": f"{cb:.2f} / {ca:.2f}",
         "Put Bid/Ask": f"{pb:.2f} / {pa:.2f}",
         "Straddle Price": round(straddle_price, 2),
-        "Decay $": round(decay_dollars, 2),
-        "Decay %": round(decay_pct, 2),
-        "Breakevens": breakevens,
         "Impl Move %": round(impl_move_pct, 2),
         "Impl Move Pts": round(impl_move_pts, 1),
         "P/C Skew": round(skew, 2),
         "IV": avg_iv,
-        "Gamma": round(straddle_gamma, 4),
-        "Theta": round(straddle_theta, 2),
         "Events": event_str,
     }
 
@@ -430,7 +409,6 @@ async def ib_loop():
                             log.info(f"New session day: {today}")
                             shared_state["session_date"] = today
                             shared_state["session_open_spot"] = None
-                            shared_state["open_straddles"] = {}
                             shared_state["prior_close"] = None
                             shared_state["straddle_history"] = []
 
@@ -465,10 +443,6 @@ async def ib_loop():
                     if changed:
                         with state_lock:
                             shared_state["status"] = f"Switched to {target_strike}"
-                            # Strike moved — clear open straddles so decay
-                            # recaptures at the new ATM strike
-                            shared_state["open_straddles"] = {}
-                            log.info("Strike changed — reset open straddles for decay tracking")
 
                     # Build table rows
                     table_data = []
@@ -478,28 +452,13 @@ async def ib_loop():
                         data = subs.tickers_map[expiry]
                         wing_data = subs.wing_tickers_map.get(expiry)
 
-                        with state_lock:
-                            if (expiry not in shared_state["open_straddles"]
-                                    and is_regular_session()):
-                                # Defer capture until we compute straddle price below
-                                pass
-                            open_straddle = shared_state["open_straddles"].get(expiry, 0)
-
                         row = build_row(
                             expiry, subs.strike,
                             data['call'], data['put'],
                             cur_spot,
                             wing_data=wing_data,
-                            open_straddle=open_straddle,
                         )
                         table_data.append(row)
-
-                        with state_lock:
-                            if (expiry not in shared_state["open_straddles"]
-                                    and row["Straddle Price"] > 0
-                                    and is_regular_session()):
-                                shared_state["open_straddles"][expiry] = row["Straddle Price"]
-                                log.info(f"Open straddle {expiry}: ${row['Straddle Price']:.2f}")
 
                     table_data.sort(key=lambda r: r["DTE"])
 
@@ -736,16 +695,6 @@ TABLE_STYLE = {
         {'if': {'column_id': 'Straddle Price'},
          'backgroundColor': '#0a2618', 'color': '#3fb950', 'fontWeight': '700',
          'borderLeft': '3px solid #238636', 'borderRight': '3px solid #238636'},
-        # Decay positive (seller profit) = green
-        {'if': {'column_id': 'Decay $', 'filter_query': '{Decay $} > 0'},
-         'color': '#3fb950', 'fontWeight': '700'},
-        {'if': {'column_id': 'Decay %', 'filter_query': '{Decay %} > 0'},
-         'color': '#3fb950'},
-        # Decay negative (straddle expansion) = red
-        {'if': {'column_id': 'Decay $', 'filter_query': '{Decay $} < 0'},
-         'color': '#f47067', 'fontWeight': '700'},
-        {'if': {'column_id': 'Decay %', 'filter_query': '{Decay %} < 0'},
-         'color': '#f47067'},
         # P/C Skew colors
         {'if': {'column_id': 'P/C Skew', 'filter_query': '{P/C Skew} > 1'},
          'color': '#f0883e'},
@@ -771,11 +720,7 @@ COLUMNS = [
     {'name': 'Put Bid/Ask', 'id': 'Put Bid/Ask'},
     {'name': 'Straddle', 'id': 'Straddle Price', 'type': 'numeric',
      'format': dash_table.FormatTemplate.money(2)},
-    {'name': 'Decay $', 'id': 'Decay $', 'type': 'numeric',
-     'format': {'specifier': '+.2f'}},
-    {'name': 'Decay %', 'id': 'Decay %', 'type': 'numeric',
-     'format': {'specifier': '+.1f'}},
-    {'name': 'Impl Pts', 'id': 'Impl Move Pts', 'type': 'numeric',
+    {'name': 'Impl Mov', 'id': 'Impl Move Pts', 'type': 'numeric',
      'format': {'specifier': '.1f'}},
     {'name': 'P/C Skew', 'id': 'P/C Skew', 'type': 'numeric',
      'format': {'specifier': '+.2f'}},
@@ -861,9 +806,7 @@ app.layout = dbc.Container([
                 sort_action='native',
                 tooltip_header={
                     'P/C Skew': '25Δ Risk Reversal: OTM put IV minus OTM call IV (vol pts). Positive = puts richer',
-                    'Decay $': 'Straddle price change from session open (positive = decay / seller profit)',
-                    'Decay %': 'Percentage decay from session-open straddle price',
-                    'Impl Pts': 'Expected move in SPX points (straddle × 0.85)',
+                    'Impl Mov': 'Expected move in SPX points (straddle × 0.85)',
                 },
                 tooltip_delay=0, tooltip_duration=None,
                 **TABLE_STYLE,
