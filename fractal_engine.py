@@ -674,7 +674,7 @@ def build_projection(matches, current_price, current_bar_idx):
     rc, rh, rl, wt = [], [], [], []
     today = now_et().date()
     for sig, scores in matches:
-        if sig.bar_count <= current_bar_idx: continue
+        if sig.bar_count <= current_bar_idx + 10: continue
         fc = sig.full_closes[current_bar_idx:]
         fh = sig.full_highs[current_bar_idx:]
         fl = sig.full_lows[current_bar_idx:]

@@ -128,7 +128,8 @@ def apply_slippage(entry_price: float, is_long: bool, vix: float = 15.0) -> floa
 
 def simulate_trade(day_df: pd.DataFrame, entry_bar_idx: int, verdict: str,
                    entry_price: float, target: float, stop: float,
-                   slippage: float = 0.0, max_bars: int = 24) -> dict:
+                   slippage: float = 0.0, max_bars: int = 24,
+                   exit_slippage: float = 0.25) -> dict:
     """Walk forward through bars checking target/stop/time-exit.
 
     max_bars=24 means 24 × 5min = 2 hours (matching the bot's time exit).
@@ -144,8 +145,9 @@ def simulate_trade(day_df: pd.DataFrame, entry_bar_idx: int, verdict: str,
             continue  # Skip entry bar
 
         if i >= max_bars:
-            # Time exit
+            # Time exit (apply adverse exit slippage)
             close = float(bar["Close"])
+            close = close - exit_slippage if is_long else close + exit_slippage
             pnl = (close - entry_price) if is_long else (entry_price - close)
             # Cap at stop if worse
             stop_pnl = (stop - entry_price) if is_long else (entry_price - stop)
@@ -174,9 +176,10 @@ def simulate_trade(day_df: pd.DataFrame, entry_bar_idx: int, verdict: str,
                 return {"outcome": ts.STOP, "pnl": round(entry_price - stop, 2),
                         "bars_held": i, "exit_price": stop}
 
-    # End of day — close at last bar
+    # End of day — close at last bar (apply adverse exit slippage)
     if len(remaining) > 1:
         last_close = float(remaining["Close"].iloc[-1])
+        last_close = last_close - exit_slippage if is_long else last_close + exit_slippage
         pnl = (last_close - entry_price) if is_long else (entry_price - last_close)
         return {"outcome": ts.TIME_EXIT, "pnl": round(pnl, 2),
                 "bars_held": len(remaining) - 1, "exit_price": last_close}
@@ -298,7 +301,7 @@ def run_backtest(cache_path: Path = Path("fractal_cache.db"),
                 break
 
             # Run fractal engine at this bar
-            entry_price = float(sim_df["Close"].iloc[try_bar - 1])
+            entry_price = float(sim_df["Open"].iloc[try_bar])
             try:
                 fractal_result = engine.analyze(
                     es_5m=combined_df,
@@ -386,6 +389,10 @@ def run_backtest(cache_path: Path = Path("fractal_cache.db"),
             )
 
             pnl = trade_result["pnl"]
+            # Subtract commission: $4.62 round-trip per ES contract = 0.0924 pts
+            COMMISSION_PTS = 0.0924
+            pnl -= COMMISSION_PTS
+            pnl = round(pnl, 2)
             outcome = trade_result["outcome"]
             result.trades_taken += 1
             result.total_pnl += pnl

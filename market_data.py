@@ -52,6 +52,29 @@ class MarketData:
             self._fetch_yfinance()
 
         logger.info(f"Market data snapshot complete ({self.data_source}).")
+        self._check_data_freshness()
+
+    def _check_data_freshness(self):
+        """Warn if latest ES data is stale during market hours."""
+        try:
+            now = now_et()
+            # Only check during market hours (weekdays 9:30-16:00 ET)
+            if now.weekday() >= 5:
+                return
+            from datetime import time as dtime
+            if not (dtime(9, 30) <= now.time() <= dtime(16, 0)):
+                return
+            if hasattr(self, 'es_today_1m') and not self.es_today_1m.empty:
+                last_bar = self.es_today_1m.index[-1]
+                if hasattr(last_bar, 'tz_localize'):
+                    last_bar = pd.Timestamp(last_bar)
+                    if last_bar.tzinfo is not None:
+                        last_bar = last_bar.tz_convert("America/New_York").tz_localize(None)
+                gap_min = (now.replace(tzinfo=None) - pd.Timestamp(last_bar)).total_seconds() / 60
+                if gap_min > 30:
+                    logger.warning(f"[STALE DATA] Latest ES bar is {gap_min:.0f} min old — data may be stale")
+        except Exception as e:
+            logger.debug(f"Data freshness check error: {e}")
 
     def _fetch_with_fallback(self, ibkr_fn, yf_fn, label: str):
         """Try IBKR first, fall back to yfinance. Returns the result or empty DataFrame/Series."""

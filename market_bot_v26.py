@@ -1,5 +1,5 @@
 """
-MARKET BOT v28.4 — ES Futures Trading Assistant (Claude-Powered + IBKR Live)
+MARKET BOT v28.5 — ES Futures Trading Assistant (Claude-Powered + IBKR Live)
 ==============================================================================
 DATA SOURCES:
 - IBKR TWS/Gateway (primary) — live prices, historical bars, SPX options
@@ -273,7 +273,7 @@ def main():
     import telegram_bot as _tg_mod
 
     logger.info("=" * 60)
-    logger.info("MARKET BOT v28.4 Starting...")
+    logger.info("MARKET BOT v28.5 Starting...")
     logger.info("=" * 60)
 
     # Initialize components
@@ -345,7 +345,7 @@ def main():
             try:
                 test_res = requests.post(test_url, data={
                     "chat_id": CFG.TELEGRAM_CHAT_ID,
-                    "text": f"MARKET BOT v28.4 ONLINE (Claude-Powered)\nGhost P&L | GEX | Flow Scanner | Vol Shift | Divergence | Adaptive Weights\nIBKR: {ibkr.get_status()}"
+                    "text": f"MARKET BOT v28.5 ONLINE (Claude-Powered)\nGhost P&L | GEX | Flow Scanner | Vol Shift | Divergence | Adaptive Weights\nIBKR: {ibkr.get_status()}"
                 }, timeout=15)
                 logger.info(f"Telegram response: {test_res.status_code} -- {test_res.text[:300]}")
                 if test_res.status_code == 200:
@@ -479,6 +479,7 @@ def main():
                                 logger.warning(f"News blackout close error: {e}")
                         if _bo_trades:
                             realized, floating = audit_open_trades(journal, _bo_md)
+                            accuracy_tracker.clear_cache()
                     except Exception as e:
                         logger.warning(f"News blackout trade close failed: {e}")
 
@@ -551,7 +552,10 @@ def main():
             logger.info(f"[{cycle_id}] Data fetch: {ibkr_ms:.0f}ms ({md.data_source})")
 
             # 2. Audit open trades first -- ensures realized P&L is current before loss limit check
+            _pre_audit_open = len(journal.get_open_trades())
             realized, floating = audit_open_trades(journal, md)
+            if len(journal.get_open_trades()) < _pre_audit_open:
+                accuracy_tracker.clear_cache()
             _update_signal_scores(journal, md.current_price)
 
             # 2b. EOD force-close: close ALL remaining open positions at 4:00 PM ET
@@ -585,6 +589,8 @@ def main():
                             logger.warning(f"EOD close error on trade {trade.get('id')}: {e}")
                     # Re-audit to update realized P&L after EOD closes
                     realized, floating = audit_open_trades(journal, md)
+                    accuracy_tracker.clear_cache()
+                    journal.maintenance()
                 last_eod_close = now
 
                 # Record fractal outcome using actual market direction (open→close),
@@ -712,7 +718,7 @@ def main():
             # Time-of-day context
             tod_context = accuracy_tracker.get_time_of_day_context()
 
-            # --- v28.4 EVIDENCE-BASED SIGNALS ---
+            # --- v28.5 EVIDENCE-BASED SIGNALS ---
             vwap_reversion = calc_vwap_reversion(md)
             bond_leadlag = calc_bond_equity_leadlag(md)
             vol_regime = calc_intraday_vol_regime(md)
@@ -994,6 +1000,7 @@ def main():
                     target_price == 0 or stop_price == 0
                     or abs(target_price - entry_price) < 2.0
                 )
+                _atr_overridden = False
                 if (_was_override or _target_garbage) and entry_price > 0:
                     _is_long = ts.is_long(verdict)
                     _old_tp, _old_sl = target_price, stop_price
@@ -1013,6 +1020,7 @@ def main():
                     data["target"] = target_price
                     data["invalidation"] = stop_price
                     _rr = abs(target_price - entry_price) / abs(entry_price - stop_price) if abs(entry_price - stop_price) > 0 else 0
+                    _atr_overridden = True
                     logger.info(
                         f"[OVERRIDE TARGETS] ATR={_atr:.1f} | "
                         f"Old TP {_old_tp:.2f} SL {_old_sl:.2f} → "
@@ -1030,10 +1038,11 @@ def main():
                         logger.info(f"[SANITY] Bearish target too close: {target_price:.2f} -> {entry_price - MIN_TARGET_PTS:.2f} (min {MIN_TARGET_PTS} pts)")
                         target_price = entry_price - MIN_TARGET_PTS
 
-                # v28.4: Tighten targets/stops by 20% — backtest showed +21% P&L,
+                # v28.5: Tighten targets/stops by 20% — backtest showed +21% P&L,
                 # +38% Sharpe, -16% drawdown with 0.8x factor
+                # Skip if ATR override already set optimal distances
                 TARGET_TIGHTEN = 0.80
-                if target_price > 0 and stop_price > 0 and entry_price > 0:
+                if not _atr_overridden and target_price > 0 and stop_price > 0 and entry_price > 0:
                     _old_tp2, _old_sl2 = target_price, stop_price
                     target_price = entry_price + (target_price - entry_price) * TARGET_TIGHTEN
                     stop_price = entry_price + (stop_price - entry_price) * TARGET_TIGHTEN
@@ -1149,40 +1158,44 @@ def main():
                             signals=_trade_signals,
                         )
                     else:
-                        _new_trade_id = journal.add_trade(
-                            price=entry_price,
-                            verdict=verdict,
-                            confidence=conf,
-                            target=target_price,
-                            stop=stop_price,
-                            contracts=contracts,
-                            reasoning=data.get("reasoning", "")[:500],
-                            session=session,
-                            signals=_trade_signals,
-                        )
-                        # Record signal for forward-looking scoring
-                        if _new_trade_id:
-                            journal.add_signal_score(
-                                trade_id=_new_trade_id,
-                                signal_time=now_et().strftime("%Y-%m-%d %H:%M"),
-                                price_at_signal=entry_price,
+                        try:
+                            _new_trade_id = journal.add_trade(
+                                price=entry_price,
                                 verdict=verdict,
+                                confidence=conf,
+                                target=target_price,
+                                stop=stop_price,
+                                contracts=contracts,
+                                reasoning=data.get("reasoning", "")[:500],
+                                session=session,
+                                signals=_trade_signals,
                             )
-                        arrow = "\U0001f7e2" if ts.is_long(verdict) else "\U0001f534"
-                        send_telegram(
-                            f"*{arrow} ADVISORY TRADE*\n"
-                            f"\n"
-                            f"*{verdict}* ({conf}%) \u2502 {contracts} ct\n"
-                            f"\n"
-                            f"`Entry  {entry_price:.2f}`\n"
-                            f"`Target {target_price:.2f}`\n"
-                            f"`Stop   {stop_price:.2f}`\n"
-                            f"`R:R    {rr:.1f}:1`"
-                        )
-                        logger.info(
-                            f"[ADVISORY] {verdict} {contracts}x ES @ {entry_price:.2f} "
-                            f"| TP {target_price:.2f} | SL {stop_price:.2f} | R:R {rr:.1f}:1"
-                        )
+                            # Record signal for forward-looking scoring
+                            if _new_trade_id:
+                                journal.add_signal_score(
+                                    trade_id=_new_trade_id,
+                                    signal_time=now_et().strftime("%Y-%m-%d %H:%M"),
+                                    price_at_signal=entry_price,
+                                    verdict=verdict,
+                                )
+                            arrow = "\U0001f7e2" if ts.is_long(verdict) else "\U0001f534"
+                            send_telegram(
+                                f"*{arrow} ADVISORY TRADE*\n"
+                                f"\n"
+                                f"*{verdict}* ({conf}%) \u2502 {contracts} ct\n"
+                                f"\n"
+                                f"`Entry  {entry_price:.2f}`\n"
+                                f"`Target {target_price:.2f}`\n"
+                                f"`Stop   {stop_price:.2f}`\n"
+                                f"`R:R    {rr:.1f}:1`"
+                            )
+                            logger.info(
+                                f"[ADVISORY] {verdict} {contracts}x ES @ {entry_price:.2f} "
+                                f"| TP {target_price:.2f} | SL {stop_price:.2f} | R:R {rr:.1f}:1"
+                            )
+                        except Exception as _trade_err:
+                            logger.error(f"[TRADE ENTRY FAILED] Journal write error: {_trade_err}")
+                            send_telegram(f"*\u26a0\ufe0f Trade entry failed* — journal error, skipping IBKR order")
 
             # 9. Send to Telegram (with tiered alert system)
             final_msg, status_line = format_analysis_message(data, metrics, prev_verdict, pnl_str, pos_str)
@@ -1322,7 +1335,7 @@ def main():
             if (_now_shutdown.weekday() < 5
                     and dtime(16, 56) <= _now_shutdown.time() <= dtime(17, 9)):
                 logger.info("Auto-shutdown: weekday 4:56-5:09 PM ET window reached.")
-                send_telegram("*MARKET BOT v28.4 OFFLINE* (auto-shutdown)")
+                send_telegram("*MARKET BOT v28.5 OFFLINE* (auto-shutdown)")
                 _shutdown(tape_reader, price_monitor, cmd_listener, ibkr)
                 break
 
@@ -1339,7 +1352,7 @@ def main():
         except KeyboardInterrupt:
             logger.info("Bot stopped by user.")
             _shutdown(tape_reader, price_monitor, cmd_listener, ibkr)
-            send_telegram("*MARKET BOT v28.4 OFFLINE* (Manual Stop)")
+            send_telegram("*MARKET BOT v28.5 OFFLINE* (Manual Stop)")
             break
         except Exception as e:
             logger.error(f"Main loop error: {e}", exc_info=True)

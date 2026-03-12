@@ -36,7 +36,7 @@ MARKET_OPEN = time(9, 30)
 MARKET_CLOSE = time(16, 0)
 
 BACKEND_INTERVAL_SEC = 120
-UI_INTERVAL_MS = 120000
+UI_INTERVAL_MS = 5000
 EXPIRY_REFRESH_MINUTES = 60
 RECONNECT_DELAY_SEC = 10
 
@@ -193,6 +193,7 @@ shared_state = {
 }
 log.info(f"Loaded {len(shared_state['straddle_history'])} history points for {_today_str}")
 state_lock = threading.Lock()
+refresh_event = threading.Event()  # signals backend to refresh immediately
 
 # ============================================================
 # HELPERS
@@ -560,7 +561,13 @@ async def ib_loop():
                         shared_state["last_update"] = now.strftime("%H:%M:%S")
                         shared_state["vix_price"] = cur_vix
 
-                    await asyncio.sleep(BACKEND_INTERVAL_SEC)
+                    # Sleep in short chunks so refresh button can wake us
+                    for _ in range(BACKEND_INTERVAL_SEC * 2):
+                        if refresh_event.is_set():
+                            refresh_event.clear()
+                            log.info("Force refresh triggered by UI")
+                            break
+                        await asyncio.sleep(0.5)
 
                 except Exception as loop_e:
                     log.error(f"Loop error: {loop_e}", exc_info=True)
@@ -661,7 +668,7 @@ def build_straddle_history_chart(history):
 
     if not history:
         fig = go.Figure()
-        fig.update_layout(**CHART_LAYOUT, title="Intraday Straddle Decay (waiting for data)",
+        fig.update_layout(**CHART_LAYOUT, title="Intraday Straddle (waiting for data)",
                           xaxis=dict(range=[range_start, range_end], autorange=False,
                                      tickformat="%H:%M", dtick=3600000))
         return fig
@@ -682,7 +689,7 @@ def build_straddle_history_chart(history):
         ))
     fig.update_layout(
         **CHART_LAYOUT,
-        title="Intraday Straddle Decay (1DTE)",
+        title="Intraday Straddle (1DTE)",
         xaxis_title="Time (ET)",
         yaxis_title="Straddle Price ($)",
         xaxis=dict(range=[range_start, range_end], autorange=False,
@@ -934,6 +941,11 @@ app.layout = dbc.Container([
      Input('refresh-btn', 'n_clicks')],
 )
 def update_dashboard(n, n_clicks):
+    # If refresh button was clicked, signal backend to do an immediate data cycle
+    is_refresh = n_clicks and dash.callback_context.triggered_id == 'refresh-btn'
+    if is_refresh:
+        refresh_event.set()
+
     with state_lock:
         df = shared_state["df"].copy()
         spot = shared_state["spot_price"]
@@ -995,6 +1007,11 @@ def update_dashboard(n, n_clicks):
 
     fig_term = build_term_structure_chart(df)
     fig_history = build_straddle_history_chart(straddle_history)
+
+    # Show visual feedback when refresh button was clicked
+    if is_refresh:
+        status = "Refreshing..."
+        last_update = datetime.now().strftime("%H:%M:%S")
 
     return (
         df.to_dict('records'),

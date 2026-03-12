@@ -400,14 +400,16 @@ def format_analysis_message(data: dict, metrics: dict, prev_verdict: str, pnl_st
 _latest_detail_msg: str = ""
 _latest_detail_time: str = ""  # timestamp of when detail was captured
 _detail_msg_lock = threading.Lock()
+_prev_card_price: float = 0.0  # track ES price across cycles for trend arrow
 
 
 def format_action_card(data: dict, metrics: dict, pos_suggestion: str, sleep_mode: str,
                        pnl_str: str = "", open_trades: list = None,
-                       skipped_rr: float = None) -> str:
+                       skipped_rr: float = None, decomposition: dict = None) -> str:
     """Produce a descriptive Telegram action card with thesis, confluence, and P&L."""
     from session_utils import is_news_approaching
 
+    global _prev_card_price
     verdict = data.get("verdict", "FLAT").upper()
     conf = int(data.get("confidence", 0))
     regime = metrics.get("regime", {}).get("regime", "N/A")
@@ -419,14 +421,53 @@ def format_action_card(data: dict, metrics: dict, pos_suggestion: str, sleep_mod
     else:
         arrow = _WHITE
 
-    # --- Header ---
+    # --- Header with VIX ---
     price = data.get("current_price", "N/A")
+    vix_val = metrics.get("vix", 0)
+    vix_tag = f" \u2502 VIX {vix_val:.1f}" if vix_val else ""
     now_card = now_et()
     time_str = now_card.strftime("%H:%M")
+
+    # Trend arrow vs last cycle
+    try:
+        _cur = float(price)
+        if _prev_card_price > 0:
+            _delta = _cur - _prev_card_price
+            if _delta > 0.25:
+                trend_arrow = f" \u25b2{_delta:+.1f}"
+            elif _delta < -0.25:
+                trend_arrow = f" \u25bc{_delta:+.1f}"
+            else:
+                trend_arrow = " \u25c0\u25b6"
+        else:
+            trend_arrow = ""
+        _prev_card_price = _cur
+    except (ValueError, TypeError):
+        trend_arrow = ""
+
     lines = [
-        f"*{arrow} {verdict} {conf}%* \u2502 {regime}",
-        f"ES `{price}` \u2502 {time_str} ET",
+        f"*{arrow} {verdict} {conf}%* \u2502 {regime}{vix_tag}",
+        f"ES `{price}`{trend_arrow} \u2502 {time_str} ET",
     ]
+
+    # --- Guard status badges (when a safety guard forced FLAT) ---
+    if decomposition:
+        guards_fired = []
+        if decomposition.get("cooldown_blocked"):
+            guards_fired.append("\U0001f6d1 *COOLDOWN* \u2014 loss < 30min ago")
+        if decomposition.get("churn_blocked"):
+            guards_fired.append("\u26a0\ufe0f *CHURN LOCK* \u2014 2+ losses in 60min")
+        if decomposition.get("session_blocked"):
+            guards_fired.append("\U0001f6ab *SESSION GATE* \u2014 WR < 25%")
+        if decomposition.get("forced_flat"):
+            if not guards_fired:  # generic forced flat (low conf, etc.)
+                guards_fired.append("\u23f8 *FLAT* \u2014 confidence too low")
+        if decomposition.get("mtf_conflict"):
+            guards_fired.append("\u21c4 *MTF CONFLICT*")
+        if guards_fired:
+            lines.append("")
+            for g in guards_fired:
+                lines.append(g)
 
     # --- Trade Levels (only for directional verdicts) ---
     _has_trade = "BULL" in verdict or "BEAR" in verdict
@@ -460,8 +501,6 @@ def format_action_card(data: dict, metrics: dict, pos_suggestion: str, sleep_mod
     # --- Thesis ---
     setup = data.get("setup", "").strip()
     if setup and setup != "N/A":
-        if len(setup) > 120:
-            setup = setup[:117] + "..."
         lines.append("")
         lines.append(f"\u25b8 *Thesis:* {setup}")
 
@@ -479,14 +518,36 @@ def format_action_card(data: dict, metrics: dict, pos_suggestion: str, sleep_mod
     mtf = metrics.get("mtf_momentum", {})
     mtf_str = mtf.get("alignment", "N/A")
 
+    # --- Signal agreement count ---
+    _signals = [fractal_str, mtf_str]
+    flow_data = metrics.get("flow_data", {})
+    flow_bias = flow_data.get("flow_bias", "N/A")
+    sweeps = metrics.get("liq_sweeps", {})
+    active_sweep = sweeps.get("active_sweep", "NONE")
+    div = metrics.get("divergence", {})
+    tick_proxy = metrics.get("tick_proxy", {})
+    tick_extreme = tick_proxy.get("extreme", "NEUTRAL")
+    if is_rth:
+        _signals.append(flow_bias)
+        _signals.append(tick_extreme)
+    if active_sweep != "NONE":
+        _signals.append(active_sweep)
+    _bull = sum(1 for s in _signals if _dir_emoji(s) == _GREEN)
+    _bear = sum(1 for s in _signals if _dir_emoji(s) == _RED)
+    _total = len(_signals)
+    if _bull > _bear:
+        _agree_str = f"{_bull}/{_total} bullish"
+    elif _bear > _bull:
+        _agree_str = f"{_bear}/{_total} bearish"
+    else:
+        _agree_str = f"split {_bull}B/{_bear}S"
+
     lines.append("")
-    lines.append("\u2500\u2500\u2500 Confluence \u2500\u2500\u2500")
+    lines.append(f"\u2500\u2500\u2500 Confluence ({_agree_str}) \u2500\u2500\u2500")
     lines.append(f"{_dir_emoji(fractal_str)} `Fractal` {fractal_str}")
     lines.append(f"{_dir_emoji(mtf_str)} `MTF    ` {mtf_str}")
 
     if is_rth:
-        flow_data = metrics.get("flow_data", {})
-        flow_bias = flow_data.get("flow_bias", "N/A")
         g_call = metrics.get("g_call", "N/A")
         g_put = metrics.get("g_put", "N/A")
         gamma_detail = metrics.get("gamma_detail", {})
@@ -499,16 +560,59 @@ def format_action_card(data: dict, metrics: dict, pos_suggestion: str, sleep_mod
     rvol_status = rvol.get("status", "N/A") if isinstance(rvol, dict) else "N/A"
     lines.append(f"`RVOL   ` {rvol_val:.1f}x ({rvol_status})")
 
-    sweeps = metrics.get("liq_sweeps", {})
-    active_sweep = sweeps.get("active_sweep", "NONE")
     if active_sweep != "NONE":
         sweep_signal = sweeps.get("signal", "")
-        sweep_str = sweep_signal[:60] + "..." if len(sweep_signal) > 60 else sweep_signal
-        lines.append(f"{_dir_emoji(active_sweep)} `Sweep  ` {sweep_str}")
+        lines.append(f"{_dir_emoji(active_sweep)} `Sweep  ` {sweep_signal}")
 
-    div = metrics.get("divergence", {})
     if div.get("score", 0) > 0:
-        lines.append(f"`Diverg ` {div.get('severity', 'None')}")
+        div_sev = div.get("severity", "None")
+        lines.append(f"{_dir_emoji('BEAR' if 'EXTREME' in str(div_sev) else div_sev)} `Diverg ` {div_sev}")
+
+    # --- Key level proximity ---
+    try:
+        _p = float(price)
+        _levels = []
+        _vpoc = metrics.get("vpoc")
+        if _vpoc and _vpoc != "N/A":
+            _levels.append(("VPOC", float(_vpoc)))
+        _vwap = metrics.get("vwap_val")
+        if _vwap and _vwap != "N/A":
+            _levels.append(("VWAP", float(_vwap)))
+        _prior = metrics.get("prior", {})
+        if _prior.get("prev_high") and _prior["prev_high"] != "N/A":
+            _levels.append(("PDH", float(_prior["prev_high"])))
+        if _prior.get("prev_low") and _prior["prev_low"] != "N/A":
+            _levels.append(("PDL", float(_prior["prev_low"])))
+        _gap = metrics.get("gap", {})
+        _onh = _gap.get("overnight_high")
+        if _onh and _onh != "N/A" and float(_onh) > 0:
+            _levels.append(("ONH", float(_onh)))
+        _onl = _gap.get("overnight_low")
+        if _onl and _onl != "N/A" and float(_onl) > 0:
+            _levels.append(("ONL", float(_onl)))
+        _gc = metrics.get("g_call")
+        if _gc and _gc != "N/A":
+            _levels.append(("GEX Call", float(_gc)))
+        _gp = metrics.get("g_put")
+        if _gp and _gp != "N/A":
+            _levels.append(("GEX Put", float(_gp)))
+        if _levels:
+            _levels.sort(key=lambda x: abs(x[1] - _p))
+            _nearest = _levels[0]
+            _dist = _p - _nearest[1]
+            _above_below = "above" if _dist > 0 else "below"
+            lines.append(f"`Near   ` {abs(_dist):.1f} pts {_above_below} {_nearest[0]} {_nearest[1]:.0f}")
+        # Key level reaction badge
+        _klr = metrics.get("key_level_reaction", {})
+        _klr_rx = _klr.get("reaction", "NONE")
+        if _klr_rx in ("REJECTION", "BREAKOUT"):
+            _rx_emoji = "\U0001f6ab" if _klr_rx == "REJECTION" else "\U0001f680"
+            lines.append(
+                f"{_rx_emoji} {_klr_rx} at {_klr.get('nearest_level','')} "
+                f"{_klr.get('nearest_price', 0):.0f} \u2192 {_klr.get('direction','')}"
+            )
+    except (ValueError, TypeError):
+        pass
 
     # --- P&L ---
     pnl_part = pnl_str if pnl_str else "P&L: $0 | Open Trades: $0"
@@ -517,19 +621,26 @@ def format_action_card(data: dict, metrics: dict, pos_suggestion: str, sleep_mod
     lines.append(f"\u2500\u2500\u2500 P&L \u2500\u2500\u2500")
     lines.append(f"{pnl_emoji} {pnl_part}")
 
-    # --- Open trades ---
+    # --- Open trades (use live price, not stale DB pnl) ---
+    live_price = float(data.get("current_price", 0))
     if open_trades:
+        live_float_total = 0.0
         lines.append("")
         lines.append("\u2500\u2500\u2500 Open Trades \u2500\u2500\u2500")
         for t in open_trades:
             t_verdict = t.get("verdict", "?")
-            t_entry = t.get("price", 0)
+            t_entry = float(t.get("price", 0))
             t_target = t.get("target", 0)
             t_stop = t.get("stop", 0)
-            t_pnl = t.get("pnl", 0)
             t_cts = int(t.get("contracts", 1) or 1)
-            t_d = t_pnl * CFG.POINT_VALUE * t_cts
             is_long = ts.is_long(t_verdict)
+            # Recalculate from live price instead of stale DB value
+            if live_price > 0 and t_entry > 0:
+                t_pnl = (live_price - t_entry) if is_long else (t_entry - live_price)
+            else:
+                t_pnl = float(t.get("pnl", 0))
+            t_d = t_pnl * CFG.POINT_VALUE * t_cts
+            live_float_total += t_d
             d = "L" if is_long else "S"
             t_emoji = _GREEN if is_long else _RED
             lines.append(
@@ -539,6 +650,17 @@ def format_action_card(data: dict, metrics: dict, pos_suggestion: str, sleep_mod
             lines.append(
                 f"  TP `{t_target:.2f}` \u2502 SL `{t_stop:.2f}`"
             )
+        # Patch the P&L summary line to use live floating total
+        if "Open Trades:" in pnl_part:
+            realized_part = pnl_part.split("|")[0].strip()
+            pnl_part = (f"{realized_part} | Open Trades: "
+                        f"{'+' if live_float_total >= 0 else '-'}${abs(live_float_total):,.0f}")
+            # Re-render the P&L section with updated value
+            pnl_emoji = "\U0001f4c8" if "+" in pnl_part[:15] else "\U0001f4c9"
+            for i, line in enumerate(lines):
+                if "\u2500 P&L \u2500" in line and i + 1 < len(lines):
+                    lines[i + 1] = f"{pnl_emoji} {pnl_part}"
+                    break
 
     # --- Footer ---
     news_approaching, news_label, _, _ = is_news_approaching()
@@ -599,7 +721,7 @@ def send_daily_recap(journal: Journal):
         try:
             with journal._conn() as conn:
                 rows = conn.execute(
-                    f"SELECT pnl, contracts, status FROM trades "
+                    f"SELECT pnl, contracts, status, realized_pnl FROM trades "
                     f"WHERE timestamp LIKE ? AND status IN {_ts.CLOSED_SQL}",
                     (f"{today_str}%",),
                 ).fetchall()
@@ -611,6 +733,7 @@ def send_daily_recap(journal: Journal):
                 avg_l = sum(losses_pts) / len(losses_pts) if losses_pts else 0
                 total_pnl_d = sum(
                     t["pnl"] * int(t.get("contracts", 1) or 1) * CFG.POINT_VALUE
+                    + float(t.get("realized_pnl", 0) or 0) * CFG.POINT_VALUE
                     for t in closed_trades
                 )
                 expectancy_d = total_pnl_d / len(closed_trades) if closed_trades else 0
@@ -689,7 +812,7 @@ def send_heartbeat(journal: Journal = None, accuracy_tracker=None):
         try:
             with journal._conn() as conn:
                 rows = conn.execute(
-                    f"SELECT pnl, contracts, status FROM trades "
+                    f"SELECT pnl, contracts, status, realized_pnl FROM trades "
                     f"WHERE timestamp LIKE ? AND status IN {_ts.CLOSED_SQL}",
                     (f"{today_str}%",),
                 ).fetchall()
@@ -700,6 +823,7 @@ def send_heartbeat(journal: Journal = None, accuracy_tracker=None):
             avg_l = sum(losses_pts) / len(losses_pts) if losses_pts else 0
             total_pnl_d = sum(
                 t["pnl"] * int(t.get("contracts", 1) or 1) * CFG.POINT_VALUE
+                + float(t.get("realized_pnl", 0) or 0)
                 for t in closed_trades
             )
             expectancy_d = total_pnl_d / len(closed_trades) if closed_trades else 0
@@ -712,7 +836,7 @@ def send_heartbeat(journal: Journal = None, accuracy_tracker=None):
         except Exception as e:
             logger.debug(f"Heartbeat stats computation failed: {e}")
 
-    # --- Open positions ---
+    # --- Open positions (compact with target/stop progress) ---
     open_trades = journal.get_open_trades()
     if open_trades:
         lines.append("")
@@ -722,51 +846,95 @@ def send_heartbeat(journal: Journal = None, accuracy_tracker=None):
             t_pnl = float(t.get("pnl", 0))
             t_pnl_d = t_pnl * CFG.POINT_VALUE * t_cts
             t_entry = float(t.get("price", 0))
+            t_target = float(t.get("target", 0))
+            t_stop = float(t.get("stop", 0))
             d = "L" if ts.is_long(t.get("verdict", "")) else "S"
             t_emoji = "\U0001f7e2" if t_pnl_d >= 0 else "\U0001f534"
+            # Progress toward target vs stop
+            t_range = abs(t_target - t_stop) if t_target and t_stop else 0
+            if t_range > 0:
+                t_progress = t_pnl / (abs(t_target - t_entry)) * 100 if abs(t_target - t_entry) > 0 else 0
+                t_progress = max(-100, min(100, t_progress))
+                prog_str = f" ({t_progress:+.0f}% to TP)"
+            else:
+                prog_str = ""
             lines.append(
-                f"{t_emoji} *{d} {t_cts}x* @ `{t_entry:.2f}` \u2502 "
-                f"*{'+' if t_pnl_d >= 0 else '-'}${abs(t_pnl_d):,.0f}* ({t_pnl:+.1f} pts)"
+                f"{t_emoji} *{d} {t_cts}x* @ `{t_entry:.2f}` \u2192 "
+                f"*{'+' if t_pnl_d >= 0 else '-'}${abs(t_pnl_d):,.0f}*{prog_str}"
             )
 
-    # --- Accuracy breakdown ---
+    # --- Accuracy breakdown (with progress bars) ---
     if accuracy_tracker is not None:
         try:
             acc = accuracy_tracker.get_recent_accuracy()
             by_session = acc.get("by_session", {})
             by_dir = acc.get("by_direction", {})
 
+            def _wr_bar(wins, total, width=6):
+                """Build a block-char progress bar for win rate."""
+                if total == 0:
+                    return "\u2591" * width
+                pct = wins / total
+                filled = round(pct * width)
+                return "\u2588" * filled + "\u2591" * (width - filled)
+
             session_parts = []
             for s, sdata in sorted(by_session.items()):
                 if sdata["total"] >= 2:
                     s_wr = sdata["wins"] / sdata["total"] * 100
-                    session_parts.append(f"{s}: {s_wr:.0f}% ({sdata['total']})")
+                    bar = _wr_bar(sdata["wins"], sdata["total"])
+                    session_parts.append(
+                        f"`{bar}` {s}: {sdata['wins']}W/{sdata['total']} ({s_wr:.0f}%)"
+                    )
             if session_parts:
                 lines.append("")
                 lines.append("\u2500\u2500\u2500 Accuracy (last 20) \u2500\u2500\u2500")
                 for sp in session_parts:
-                    lines.append(f"\u25b8 {sp}")
+                    lines.append(sp)
 
-            dir_parts = []
-            for d_name, ddata in by_dir.items():
-                if ddata["total"] >= 2:
-                    d_wr = ddata["wins"] / ddata["total"] * 100
-                    dir_parts.append(f"{d_name}: {d_wr:.0f}% ({ddata['total']})")
-            if dir_parts:
-                lines.append("Direction: " + " \u2502 ".join(dir_parts))
+            # Direction labels: "Long calls: 3W/15 (20%)" instead of "BULLISH: 20% (15)"
+            if by_dir:
+                dir_lines = []
+                for d_name, ddata in by_dir.items():
+                    if ddata["total"] >= 2:
+                        d_wr = ddata["wins"] / ddata["total"] * 100
+                        label = "Long" if "BULL" in d_name.upper() else "Short"
+                        emoji = "\U0001f7e2" if d_wr >= 40 else "\U0001f7e1" if d_wr >= 25 else "\U0001f534"
+                        bar = _wr_bar(ddata["wins"], ddata["total"])
+                        dir_lines.append(
+                            f"{emoji} `{bar}` {label}: {ddata['wins']}W/{ddata['total']} ({d_wr:.0f}%)"
+                        )
+                if dir_lines:
+                    for dl in dir_lines:
+                        lines.append(dl)
 
-            if acc.get("streak", 0) >= 2:
-                lines.append(f"Streak: {acc['streak']} {acc['streak_type']}")
+            # Streak indicator
+            streak = acc.get("streak", 0)
+            streak_type = acc.get("streak_type", "")
+            if streak >= 2:
+                s_emoji = "\U0001f525" if streak_type == "WIN" else "\u2744\ufe0f"
+                lines.append(f"{s_emoji} Streak: {streak} {streak_type}{'s' if streak > 1 else ''}")
+
         except Exception as e:
             logger.debug(f"Heartbeat accuracy stats failed: {e}")
 
-    # --- Footer ---
+    # --- Week summary (with WR and expectancy) ---
     wk_emoji = "\U0001f4c8" if weekly_d >= 0 else "\U0001f4c9"
+    wk_total = weekly.get("total", 0)
+    wk_wins = weekly.get("wins", 0)
+    wk_wr = (wk_wins / wk_total * 100) if wk_total > 0 else 0
+    wk_expect = (weekly_d / wk_total) if wk_total > 0 else 0
     lines.append("")
     lines.append(
-        f"{wk_emoji} *Week:* {weekly['total']} trades \u2502 "
-        f"{'+' if weekly_d >= 0 else '-'}${abs(weekly_d):,.0f}"
+        f"{wk_emoji} *Week:* {wk_total} trades ({wk_wins}W) "
+        f"{wk_wr:.0f}% WR \u2502 "
+        f"*{'+' if weekly_d >= 0 else '-'}${abs(weekly_d):,.0f}*"
     )
+    if wk_total >= 2:
+        e_emoji = "\u2705" if wk_expect >= 0 else "\u274c"
+        lines.append(
+            f"{e_emoji} E[trade]: *{'+' if wk_expect >= 0 else '-'}${abs(wk_expect):,.0f}*"
+        )
 
     send_telegram("\n".join(lines))
 
@@ -833,50 +1001,54 @@ class TelegramCommandListener:
                     text = msg.get("text", "").strip().lower()
                     chat_id = str(msg.get("chat", {}).get("id", ""))
 
+                    if text.startswith("/"):
+                        logger.info(f"Telegram cmd received: '{text}' from chat_id={chat_id} (expected={CFG.TELEGRAM_CHAT_ID})")
+
                     if chat_id != CFG.TELEGRAM_CHAT_ID:
                         continue
 
-                    if text == "/status":
+                    try:
+                      if text == "/status":
                         self._handle_status(get_session_phase, ChartLibrary)
-                    elif text == "/recap":
+                      elif text == "/recap":
                         send_daily_recap(self.journal)
-                    elif text == "/pnl":
+                      elif text == "/pnl":
                         self._handle_pnl()
-                    elif text == "/trades":
+                      elif text == "/trades":
                         self._handle_trades()
-                    elif text == "/risk":
+                      elif text == "/risk":
                         self._handle_risk()
-                    elif text == "/skipped":
+                      elif text == "/skipped":
                         self._handle_skipped()
-                    elif text == "/charts":
+                      elif text == "/charts":
                         self._handle_charts(ChartLibrary)
-                    elif text == "/quiet":
+                      elif text == "/quiet":
                         if self.alert_tier:
                             self.alert_tier.quiet_mode = True
                             send_telegram("*Quiet mode ON* -- Only sending updates when signals change.\nUse /full to restore full updates.")
                         else:
                             send_telegram("Alert system not available.")
-                    elif text == "/full":
+                      elif text == "/full":
                         if self.alert_tier:
                             self.alert_tier.quiet_mode = False
                             send_telegram("*Full mode ON* -- Sending complete analysis every cycle.")
                         else:
                             send_telegram("Alert system not available.")
-                    elif text == "/detail":
+                      elif text == "/detail":
                         self._handle_detail()
-                    elif text == "/health":
+                      elif text == "/health":
                         self._handle_health()
-                    elif text == "/week":
+                      elif text == "/week":
                         self._handle_week()
-                    elif text == "/month":
+                      elif text == "/month":
                         self._handle_month()
-                    elif text == "/signals":
+                      elif text == "/signals":
                         self._handle_signals()
-                    elif text == "/shadow":
+                      elif text == "/shadow":
                         self._handle_shadow()
-                    elif text.startswith("/config"):
+                      elif text.startswith("/config"):
                         self._handle_config(text)
-                    elif text == "/help":
+                      elif text == "/help":
                         send_telegram(
                             "*Commands:*\n"
                             "/status -- Current bot state\n"
@@ -897,6 +1069,13 @@ class TelegramCommandListener:
                             "/full -- Full analysis every cycle\n"
                             "/help -- This message"
                         )
+                    except Exception as _cmd_err:
+                      _cmd = text.split()[0] if text else "unknown"
+                      logger.error(f"Command {_cmd} failed: {_cmd_err}", exc_info=True)
+                      try:
+                          send_telegram(f"*\u26a0\ufe0f Command failed:* `{_cmd}`\n`{str(_cmd_err)[:200]}`")
+                      except Exception:
+                          pass
 
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.ReadTimeout,
