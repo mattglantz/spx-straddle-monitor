@@ -1,0 +1,36 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Databases & caches
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+*.log
+logs/
+
+# Claude config
+.claude/
+
+# Windows artifacts
+nul
+
+# Archives
+*.zip
+
+# Generated charts (31MB+ of JPGs)
+chart_library/
+
+# Separate projects
+assetdashboard/
+Asset Screen Scraper/
+News Monitor/
+TreasSettlementDays/
+Weekly Stock Catalysts/
+archive/
+News_Monitor.vbs
