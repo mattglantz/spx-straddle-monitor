@@ -194,7 +194,8 @@ def run_backtest(cache_path: Path = Path("fractal_cache.db"),
                  any_bar: bool = False,
                  entry_bar: int | None = None,
                  walk_forward: bool = False,
-                 tighten: float = 1.0) -> BacktestResult:
+                 tighten: float = 1.0,
+                 threshold_override: int | None = None) -> BacktestResult:
     """Run the backtest across cached historical days."""
 
     cache = DayCache(cache_path)
@@ -281,6 +282,8 @@ def run_backtest(cache_path: Path = Path("fractal_cache.db"),
             day_type={"trend_probability": 50},
             mtf={"score": 0},
         )
+        if threshold_override is not None:
+            regime["flat_threshold"] = threshold_override
 
         # Determine which bars to try for entry
         if any_bar:
@@ -915,6 +918,8 @@ if __name__ == "__main__":
                         help="Test window size in days (default: 10)")
     parser.add_argument("--tighten", type=float, default=1.0,
                         help="Scale target/stop distance (e.g., 0.8 = 20%% tighter)")
+    parser.add_argument("--threshold", type=int, default=None,
+                        help="Override flat_threshold (e.g., 55, 65, 75)")
     args = parser.parse_args()
 
     if args.walk_forward_report:
@@ -938,6 +943,7 @@ if __name__ == "__main__":
             verbose=True,
             walk_forward=args.walk_forward if hasattr(args, 'walk_forward') else False,
             tighten=args.tighten,
+            threshold_override=args.threshold,
         )
         if result.trade_log:
             t = result.trade_log[0]
@@ -973,6 +979,7 @@ if __name__ == "__main__":
         entry_bar=args.entry_bar,
         walk_forward=args.walk_forward,
         tighten=args.tighten,
+        threshold_override=args.threshold,
     )
     print_results(result)
     if args.fractal_report:
