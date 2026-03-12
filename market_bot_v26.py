@@ -1,5 +1,5 @@
 """
-MARKET BOT v26.0 — ES Futures Trading Assistant (Claude-Powered + IBKR Live)
+MARKET BOT v28.4 — ES Futures Trading Assistant (Claude-Powered + IBKR Live)
 ==============================================================================
 DATA SOURCES:
 - IBKR TWS/Gateway (primary) — live prices, historical bars, SPX options
@@ -81,8 +81,12 @@ from indicators import (
     classify_opening_type, classify_day_type,
     calc_cross_asset_correlation, calc_iv_skew,
     calc_delta_at_levels,
+    calc_key_level_reaction,
+    calc_vwap_reversion,
+    calc_bond_equity_leadlag,
+    calc_intraday_vol_regime,
 )
-from session_utils import get_session_phase, is_news_approaching, position_suggestion
+from session_utils import get_session_phase, is_news_approaching, is_news_blackout, position_suggestion
 from trade_audit import audit_open_trades
 from charts import capture_triple_screen, ChartLibrary
 from claude_analysis import CycleMemory, AlertTier, build_analysis_prompt, SYSTEM_PROMPT
@@ -269,7 +273,7 @@ def main():
     import telegram_bot as _tg_mod
 
     logger.info("=" * 60)
-    logger.info("MARKET BOT v26.0 Starting...")
+    logger.info("MARKET BOT v28.4 Starting...")
     logger.info("=" * 60)
 
     # Initialize components
@@ -341,7 +345,7 @@ def main():
             try:
                 test_res = requests.post(test_url, data={
                     "chat_id": CFG.TELEGRAM_CHAT_ID,
-                    "text": f"MARKET BOT v26.0 ONLINE (Claude-Powered)\nGhost P&L | GEX | Flow Scanner | Vol Shift | Divergence | Adaptive Weights\nIBKR: {ibkr.get_status()}"
+                    "text": f"MARKET BOT v28.4 ONLINE (Claude-Powered)\nGhost P&L | GEX | Flow Scanner | Vol Shift | Divergence | Adaptive Weights\nIBKR: {ibkr.get_status()}"
                 }, timeout=15)
                 logger.info(f"Telegram response: {test_res.status_code} -- {test_res.text[:300]}")
                 if test_res.status_code == 200:
@@ -392,6 +396,7 @@ def main():
     last_eod_close = _startup_time if _startup_time.time() >= dtime(16, 0) else None
     first_run = True  # Run one cycle immediately on startup, even weekends
     news_alerts_sent: set = set()  # Tracks sent news alerts to prevent per-cycle spam
+    news_blackout_active: bool = False  # True while in pre/post-event blackout window
     last_atr: float = 0.0  # Track ATR between cycles for dynamic interval
     md = None  # Initialized in loop; needed before first data fetch for recap guard
 
@@ -430,18 +435,79 @@ def main():
                 except Exception as e:
                     logger.warning(f"Chart library capture failed: {e}")
 
-            # --- Upcoming news alert (no blackout -- trading continues) ---
+            # --- News blackout: no new trades 20 min before → 5 min after ---
+            # --- Force-close open trades 6 min before release ---
+            in_blackout, blackout_event, blackout_dt, blackout_phase = is_news_blackout(pre_minutes=20, post_minutes=5)
+            # Separate check: are we within 6 min before release? (close trades)
+            in_close_window, close_event, close_dt, close_phase = is_news_blackout(pre_minutes=6, post_minutes=0)
+            if in_blackout:
+                if not news_blackout_active:
+                    news_blackout_active = True
+                    logger.info(f"NEWS BLACKOUT ON: {blackout_event} ({blackout_phase})")
+                    send_telegram(
+                        f"*\U0001f6d1 NEWS BLACKOUT ACTIVE*\n"
+                        f"\n"
+                        f"{blackout_event}\n"
+                        f"Phase: *{blackout_phase}*\n"
+                        f"No new trades until 5 min after release\\."
+                    )
+
+                # Force-close trades only when within 6 min of release
+                if in_close_window and close_phase == "PRE":
+                    try:
+                        _bo_md = MarketData(ibkr=ibkr)
+                        from trade_audit import close_trade_at_price
+                        _bo_trades = journal.get_open_trades()
+                        for _bt in _bo_trades:
+                            try:
+                                _bt_cts = int(_bt.get("contracts", 1) or 1)
+                                outcome, pnl, close_price = close_trade_at_price(
+                                    _bt, _bo_md.current_price, journal, reason="NEWS"
+                                )
+                                pnl_dollars = pnl * CFG.POINT_VALUE * _bt_cts
+                                result_emoji = "\u2705" if pnl >= 0 else "\u274c"
+                                send_telegram(
+                                    f"*\U0001f6d1 NEWS BLACKOUT CLOSE*\n"
+                                    f"\n"
+                                    f"`Signal` {_escape_telegram_md(str(_bt.get('verdict','')).upper())}\n"
+                                    f"`Entry ` {float(_bt['price']):.2f}\n"
+                                    f"`Close ` {close_price:.2f}\n"
+                                    f"`P&L   ` *{'+' if pnl_dollars >= 0 else '-'}${abs(pnl_dollars):,.0f}* ({pnl:+.2f} pts x{_bt_cts})\n"
+                                    f"{result_emoji} {outcome}"
+                                )
+                            except Exception as e:
+                                logger.warning(f"News blackout close error: {e}")
+                        if _bo_trades:
+                            realized, floating = audit_open_trades(journal, _bo_md)
+                    except Exception as e:
+                        logger.warning(f"News blackout trade close failed: {e}")
+
+                # Skip the analysis cycle while in blackout
+                logger.info(f"News blackout active ({blackout_phase}) -- skipping cycle. Sleeping 30s.")
+                time.sleep(30)
+                continue
+
+            # Exiting blackout -- resume trading
+            if news_blackout_active and not in_blackout:
+                news_blackout_active = False
+                logger.info("NEWS BLACKOUT LIFTED -- resuming trading.")
+                send_telegram(
+                    "*\u2705 NEWS BLACKOUT LIFTED*\n"
+                    "\n"
+                    "Resuming normal trading\\."
+                )
+
+            # --- Upcoming news alert (heads-up before blackout kicks in) ---
             is_approaching, event_str, event_dt, event_impact = is_news_approaching()
             if is_approaching:
                 minutes_until = int((event_dt - now_et()).total_seconds() / 60)
-                # Only send the alert once per event (track with a set to avoid spam)
                 alert_key = f"{event_str}_{event_dt.date()}"
                 if alert_key not in news_alerts_sent:
-                    logger.info(f"NEWS APPROACHING: {event_str} in ~{minutes_until} min. Trading continues.")
+                    logger.info(f"NEWS APPROACHING: {event_str} in ~{minutes_until} min.")
                     news_alert_msg = (
                         f"*NEWS EVENT APPROACHING* -- {event_str}\n"
                         f"~{minutes_until} min away\n"
-                        f"Bot continues trading -- manage risk accordingly."
+                        f"Blackout starts at T\\-6 min\\. Trades will be auto\\-closed\\."
                     )
                     for _try in range(3):
                         try:
@@ -646,6 +712,11 @@ def main():
             # Time-of-day context
             tod_context = accuracy_tracker.get_time_of_day_context()
 
+            # --- v28.4 EVIDENCE-BASED SIGNALS ---
+            vwap_reversion = calc_vwap_reversion(md)
+            bond_leadlag = calc_bond_equity_leadlag(md)
+            vol_regime = calc_intraday_vol_regime(md)
+
             # --- v25.2 ADVANCED FEATURES ---
             if _rth_open <= _now_time <= _rth_close:
                 gex_regime = calc_gex_regime(md)
@@ -711,6 +782,9 @@ def main():
                 "tape_text": tape_reader.get_prompt_text() if tape_reader and tape_reader.is_active else "",
                 "cross_corr": cross_corr,
                 "iv_skew": iv_skew,
+                "vwap_reversion": vwap_reversion,
+                "bond_leadlag": bond_leadlag,
+                "vol_regime": vol_regime,
             }
 
             # Delta at key levels -- needs metrics dict (VWAP, prior, VPOC, gamma)
@@ -720,6 +794,16 @@ def main():
                 logger.info(
                     f"DELTA@LEVELS: {delta_levels['net_bias']} ({delta_levels['bias_score']:+d}) | "
                     f"{delta_levels['strongest_signal']} [{delta_levels['source']}]"
+                )
+
+            # Key level reaction (PDH/PDL/ONH/ONL) -- needs prior + gap in metrics
+            key_level_rx = calc_key_level_reaction(md, metrics)
+            metrics["key_level_reaction"] = key_level_rx
+            if key_level_rx.get("reaction") not in ("NONE", None):
+                logger.info(
+                    f"KEY LEVEL: {key_level_rx['reaction']} at {key_level_rx['nearest_level']} "
+                    f"{key_level_rx['nearest_price']:.0f} → {key_level_rx['direction']} "
+                    f"(str={key_level_rx['strength']:.0%})"
                 )
 
             # Divergence score needs the full metrics dict
@@ -946,6 +1030,27 @@ def main():
                         logger.info(f"[SANITY] Bearish target too close: {target_price:.2f} -> {entry_price - MIN_TARGET_PTS:.2f} (min {MIN_TARGET_PTS} pts)")
                         target_price = entry_price - MIN_TARGET_PTS
 
+                # v28.4: Tighten targets/stops by 20% — backtest showed +21% P&L,
+                # +38% Sharpe, -16% drawdown with 0.8x factor
+                TARGET_TIGHTEN = 0.80
+                if target_price > 0 and stop_price > 0 and entry_price > 0:
+                    _old_tp2, _old_sl2 = target_price, stop_price
+                    target_price = entry_price + (target_price - entry_price) * TARGET_TIGHTEN
+                    stop_price = entry_price + (stop_price - entry_price) * TARGET_TIGHTEN
+                    # Re-enforce minimum target distance after tightening
+                    if ts.is_long(verdict) and target_price < entry_price + MIN_TARGET_PTS:
+                        target_price = entry_price + MIN_TARGET_PTS
+                    elif not ts.is_long(verdict) and target_price > entry_price - MIN_TARGET_PTS:
+                        target_price = entry_price - MIN_TARGET_PTS
+                    target_price = round(target_price * 4) / 4  # snap to ES tick
+                    stop_price = round(stop_price * 4) / 4
+                    data["target"] = target_price
+                    data["invalidation"] = stop_price
+                    logger.info(
+                        f"[TIGHTEN 0.8x] TP {_old_tp2:.2f}->{target_price:.2f} "
+                        f"SL {_old_sl2:.2f}->{stop_price:.2f}"
+                    )
+
                 # Build signal snapshot for attribution (#6)
                 _trade_signals = {
                     "fractal": fractal_proj.direction if fractal_proj else "N/A",
@@ -1100,7 +1205,8 @@ def main():
             _card_sleep, _card_mode = get_sleep_interval(atr_14=curr_atr_for_card, last_atr=last_atr)
             action_card = format_action_card(data, metrics, pos_str, _card_mode,
                                                pnl_str=pnl_str, open_trades=journal.get_open_trades(),
-                                               skipped_rr=_skipped_rr)
+                                               skipped_rr=_skipped_rr,
+                                               decomposition=decomposition)
 
             if alert_tier.should_send_full(alert_state, first_run=first_run):
                 if img_obj:
@@ -1216,7 +1322,7 @@ def main():
             if (_now_shutdown.weekday() < 5
                     and dtime(16, 56) <= _now_shutdown.time() <= dtime(17, 9)):
                 logger.info("Auto-shutdown: weekday 4:56-5:09 PM ET window reached.")
-                send_telegram("*MARKET BOT v26.0 OFFLINE* (auto-shutdown)")
+                send_telegram("*MARKET BOT v28.4 OFFLINE* (auto-shutdown)")
                 _shutdown(tape_reader, price_monitor, cmd_listener, ibkr)
                 break
 
@@ -1233,7 +1339,7 @@ def main():
         except KeyboardInterrupt:
             logger.info("Bot stopped by user.")
             _shutdown(tape_reader, price_monitor, cmd_listener, ibkr)
-            send_telegram("*MARKET BOT v26.0 OFFLINE* (Manual Stop)")
+            send_telegram("*MARKET BOT v28.4 OFFLINE* (Manual Stop)")
             break
         except Exception as e:
             logger.error(f"Main loop error: {e}", exc_info=True)

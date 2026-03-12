@@ -193,7 +193,8 @@ def run_backtest(cache_path: Path = Path("fractal_cache.db"),
                  verbose: bool = False,
                  any_bar: bool = False,
                  entry_bar: int | None = None,
-                 walk_forward: bool = False) -> BacktestResult:
+                 walk_forward: bool = False,
+                 tighten: float = 1.0) -> BacktestResult:
     """Run the backtest across cached historical days."""
 
     cache = DayCache(cache_path)
@@ -362,6 +363,11 @@ def run_backtest(cache_path: Path = Path("fractal_cache.db"),
                 target_price = entry_price + 4.0
             if "BEAR" in final_verdict and target_price >= entry_price:
                 target_price = entry_price - 4.0
+
+            # Apply tighten factor (shrinks target/stop distance from entry)
+            if tighten != 1.0:
+                target_price = entry_price + (target_price - entry_price) * tighten
+                stop_price = entry_price + (stop_price - entry_price) * tighten
 
             # Apply slippage to entry price
             is_long = "BULL" in final_verdict.upper()
@@ -907,6 +913,8 @@ if __name__ == "__main__":
                         help="Training window size in days (default: 30)")
     parser.add_argument("--test-days", type=int, default=10,
                         help="Test window size in days (default: 10)")
+    parser.add_argument("--tighten", type=float, default=1.0,
+                        help="Scale target/stop distance (e.g., 0.8 = 20%% tighter)")
     args = parser.parse_args()
 
     if args.walk_forward_report:
@@ -929,6 +937,7 @@ if __name__ == "__main__":
             min_entry_bars=args.min_bars,
             verbose=True,
             walk_forward=args.walk_forward if hasattr(args, 'walk_forward') else False,
+            tighten=args.tighten,
         )
         if result.trade_log:
             t = result.trade_log[0]
@@ -963,6 +972,7 @@ if __name__ == "__main__":
         any_bar=args.any_bar,
         entry_bar=args.entry_bar,
         walk_forward=args.walk_forward,
+        tighten=args.tighten,
     )
     print_results(result)
     if args.fractal_report:
