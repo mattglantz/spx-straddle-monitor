@@ -363,12 +363,24 @@ def compute_spot(spx_ticker, es_ticker):
     spx_close = safe_float(spx_ticker.close)
     es_last = safe_float(es_ticker.last)
     es_close = safe_float(es_ticker.close)
+
     if is_regular_session():
-        spot = spx_last if spx_last > 0 else spx_close
-        return spot, "Live SPX"
-    if spx_close > 0 and es_last > 0 and es_close > 0:
-        delta = es_last - es_close
-        return spx_close + delta, f"Implied (ES {delta:+.2f})"
+        if spx_last > 0:
+            # Sanity check: if SPX last is >20 pts off ES, SPX data is stale
+            if es_last > 0 and abs(spx_last - es_last) > 20:
+                log.warning(f"SPX last ({spx_last:.2f}) stale vs ES ({es_last:.2f}), using ES")
+                return es_last, f"ES Proxy ({es_last:.2f})"
+            return spx_last, "Live SPX"
+        # No SPX last — use ES directly
+        if es_last > 0:
+            return es_last, f"ES Proxy ({es_last:.2f})"
+        if spx_close > 0:
+            return spx_close, "SPX Close (no live data)"
+        return 0.0, "No Data"
+
+    # Outside regular session — use ES last directly (most reliable)
+    if es_last > 0:
+        return es_last, f"ES Proxy ({es_last:.2f})"
     if spx_close > 0:
         return spx_close, "SPX Close (waiting for ES)"
     return 0.0, "No Data"

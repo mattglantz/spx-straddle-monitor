@@ -613,10 +613,13 @@ def _staleness_decay(metrics: dict, signal_key: str) -> float:
     return 0.3
 
 
-def calc_signal_confluence(metrics: dict) -> dict:
+def calc_signal_confluence(metrics: dict, signal_weights: dict = None) -> dict:
     """
     Detect when multiple independent signals agree on direction.
     Returns a conviction floor that post-hoc penalties cannot breach.
+
+    v29: Accepts optional signal_weights dict from SignalWeightManager
+    to scale individual signal vote weights based on rolling accuracy.
 
     v26.1: Continuous confidence-weighted votes (replaces binary 1.0).
     v26.1: Signal staleness decay — older signals get reduced vote weight.
@@ -630,6 +633,11 @@ def calc_signal_confluence(metrics: dict) -> dict:
         signals_checked = 0
         confirming = []
 
+        # v29: Signal weight multipliers from SignalWeightManager
+        _sw = signal_weights or {}
+        def _apply_sw(name: str, wt: float) -> float:
+            return round(wt * _sw.get(name, 1.0), 2)
+
         # 1. Fractal projection — capped at 1.0 like other signals.
         # Was 1.0-2.0, but fractal-aligned trades only won 25% (2W/8T in last 20).
         # A single fractal shouldn't dominate confluence scoring — it's one vote.
@@ -640,7 +648,7 @@ def calc_signal_confluence(metrics: dict) -> dict:
             # Scale weight 0.6-1.0 by confidence (65%→0.6, 90%+→1.0)
             fractal_weight = round(0.6 + min(0.4, (proj.confidence - 65) / 62.5), 2)
             fractal_weight *= _staleness_decay(metrics, "fractal")
-            fractal_weight = round(fractal_weight, 2)
+            fractal_weight = _apply_sw("fractal", fractal_weight)
             if "BULL" in proj.direction:
                 direction_votes["BULLISH"] += fractal_weight
                 confirming.append(f"Fractal {proj.direction} ({proj.confidence}%, wt={fractal_weight})")
@@ -664,12 +672,12 @@ def calc_signal_confluence(metrics: dict) -> dict:
         active_sweep = sweeps.get("active_sweep", "NONE")
         sweep_decay = _staleness_decay(metrics, "liq_sweeps")
         if active_sweep == "BEAR TRAP":
-            sweep_wt = round(1.0 * sweep_decay, 2)
+            sweep_wt = _apply_sw("sweep", round(1.0 * sweep_decay, 2))
             direction_votes["BULLISH"] += sweep_wt
             confirming.append(f"Bear Trap (wt={sweep_wt})")
             signals_checked += 1
         elif active_sweep == "BULL TRAP":
-            sweep_wt = round(1.0 * sweep_decay, 2)
+            sweep_wt = _apply_sw("sweep", round(1.0 * sweep_decay, 2))
             direction_votes["BEARISH"] += sweep_wt
             confirming.append(f"Bull Trap (wt={sweep_wt})")
             signals_checked += 1
@@ -679,22 +687,22 @@ def calc_signal_confluence(metrics: dict) -> dict:
         mtf_align = mtf.get("alignment", "")
         mtf_decay = _staleness_decay(metrics, "mtf_momentum")
         if "FULL BULLISH" in mtf_align:
-            mtf_wt = round(1.0 * mtf_decay, 2)
+            mtf_wt = _apply_sw("mtf", round(1.0 * mtf_decay, 2))
             direction_votes["BULLISH"] += mtf_wt
             confirming.append(f"MTF: {mtf_align} (wt={mtf_wt})")
             signals_checked += 1
         elif "MOSTLY BULLISH" in mtf_align:
-            mtf_wt = round(0.7 * mtf_decay, 2)
+            mtf_wt = _apply_sw("mtf", round(0.7 * mtf_decay, 2))
             direction_votes["BULLISH"] += mtf_wt
             confirming.append(f"MTF: {mtf_align} (wt={mtf_wt})")
             signals_checked += 1
         elif "FULL BEARISH" in mtf_align:
-            mtf_wt = round(1.0 * mtf_decay, 2)
+            mtf_wt = _apply_sw("mtf", round(1.0 * mtf_decay, 2))
             direction_votes["BEARISH"] += mtf_wt
             confirming.append(f"MTF: {mtf_align} (wt={mtf_wt})")
             signals_checked += 1
         elif "MOSTLY BEARISH" in mtf_align:
-            mtf_wt = round(0.7 * mtf_decay, 2)
+            mtf_wt = _apply_sw("mtf", round(0.7 * mtf_decay, 2))
             direction_votes["BEARISH"] += mtf_wt
             confirming.append(f"MTF: {mtf_align} (wt={mtf_wt})")
             signals_checked += 1
@@ -723,22 +731,22 @@ def calc_signal_confluence(metrics: dict) -> dict:
         open_bias = opening.get("bias", "").upper()
         open_decay = _staleness_decay(metrics, "opening_type")
         if open_bias == "STRONGLY BULLISH":
-            open_wt = round(1.0 * open_decay, 2)
+            open_wt = _apply_sw("opening", round(1.0 * open_decay, 2))
             direction_votes["BULLISH"] += open_wt
             confirming.append(f"Open: {opening.get('type', '')} ({open_bias}, wt={open_wt})")
             signals_checked += 1
         elif open_bias == "BULLISH":
-            open_wt = round(0.6 * open_decay, 2)
+            open_wt = _apply_sw("opening", round(0.6 * open_decay, 2))
             direction_votes["BULLISH"] += open_wt
             confirming.append(f"Open: {opening.get('type', '')} ({open_bias}, wt={open_wt})")
             signals_checked += 1
         elif open_bias == "STRONGLY BEARISH":
-            open_wt = round(1.0 * open_decay, 2)
+            open_wt = _apply_sw("opening", round(1.0 * open_decay, 2))
             direction_votes["BEARISH"] += open_wt
             confirming.append(f"Open: {opening.get('type', '')} ({open_bias}, wt={open_wt})")
             signals_checked += 1
         elif open_bias == "BEARISH":
-            open_wt = round(0.6 * open_decay, 2)
+            open_wt = _apply_sw("opening", round(0.6 * open_decay, 2))
             direction_votes["BEARISH"] += open_wt
             confirming.append(f"Open: {opening.get('type', '')} ({open_bias}, wt={open_wt})")
             signals_checked += 1
@@ -749,12 +757,12 @@ def calc_signal_confluence(metrics: dict) -> dict:
         dal_score = abs(dal.get("bias_score", 0))
         dal_decay = _staleness_decay(metrics, "delta_levels")
         if dal_bias == "BULLISH" and dal_score >= 20:
-            dal_wt = round(min(1.5, 1.0 + (dal_score - 20) / 160) * dal_decay, 2)
+            dal_wt = _apply_sw("delta_levels", round(min(1.5, 1.0 + (dal_score - 20) / 160) * dal_decay, 2))
             direction_votes["BULLISH"] += dal_wt
             confirming.append(f"Delta@Levels: {dal_bias} ({dal_score}%, wt={dal_wt})")
             signals_checked += 1
         elif dal_bias == "BEARISH" and dal_score >= 20:
-            dal_wt = round(min(1.5, 1.0 + (dal_score - 20) / 160) * dal_decay, 2)
+            dal_wt = _apply_sw("delta_levels", round(min(1.5, 1.0 + (dal_score - 20) / 160) * dal_decay, 2))
             direction_votes["BEARISH"] += dal_wt
             confirming.append(f"Delta@Levels: {dal_bias} ({dal_score}%, wt={dal_wt})")
             signals_checked += 1
@@ -765,7 +773,7 @@ def calc_signal_confluence(metrics: dict) -> dict:
         klr_dir = klr.get("direction", "NEUTRAL")
         if klr_reaction in ("REJECTION", "BREAKOUT") and klr_dir in ("BULLISH", "BEARISH"):
             base_wt = 1.0 if klr_reaction == "BREAKOUT" else 0.7
-            klr_wt = round(base_wt * klr.get("strength", 0.5), 2)
+            klr_wt = _apply_sw("key_level", round(base_wt * klr.get("strength", 0.5), 2))
             direction_votes[klr_dir] += klr_wt
             confirming.append(
                 f"KeyLevel: {klr_reaction} at {klr.get('nearest_level','?')} "
@@ -778,7 +786,7 @@ def calc_signal_confluence(metrics: dict) -> dict:
         vwap_bias = vwap_rev.get("bias", "NEUTRAL")
         vwap_strength = vwap_rev.get("strength", 0.0)
         if vwap_bias in ("BULLISH", "LEAN BULLISH") and vwap_strength > 0:
-            vwap_wt = round(min(1.5, 0.8 + vwap_strength), 2)
+            vwap_wt = _apply_sw("vwap_reversion", round(min(1.5, 0.8 + vwap_strength), 2))
             direction_votes["BULLISH"] += vwap_wt
             confirming.append(
                 f"VWAP Reversion: {vwap_rev.get('z_score', 0):+.1f} SD → "
@@ -786,7 +794,7 @@ def calc_signal_confluence(metrics: dict) -> dict:
             )
             signals_checked += 1
         elif vwap_bias in ("BEARISH", "LEAN BEARISH") and vwap_strength > 0:
-            vwap_wt = round(min(1.5, 0.8 + vwap_strength), 2)
+            vwap_wt = _apply_sw("vwap_reversion", round(min(1.5, 0.8 + vwap_strength), 2))
             direction_votes["BEARISH"] += vwap_wt
             confirming.append(
                 f"VWAP Reversion: {vwap_rev.get('z_score', 0):+.1f} SD → "
@@ -800,13 +808,49 @@ def calc_signal_confluence(metrics: dict) -> dict:
         bond_strength = bond_ll.get("strength", 0.0)
         bond_divergence = bond_ll.get("divergence", False)
         if bond_divergence and bond_bias in ("BULLISH", "BEARISH") and bond_strength > 0:
-            bond_wt = round(min(1.2, 0.6 + bond_strength * 0.6), 2)
+            bond_wt = _apply_sw("bond_leadlag", round(min(1.2, 0.6 + bond_strength * 0.6), 2))
             direction_votes[bond_bias] += bond_wt
             confirming.append(
                 f"Bond Lead-Lag: TNX {bond_ll.get('tnx_move_bps', 0):+.1f} bps → "
                 f"{bond_bias} (wt={bond_wt})"
             )
             signals_checked += 1
+
+        # 12. VIX9D term structure (v29 — contrarian short-term fear gauge)
+        if CFG.VIX9D_CONFLUENCE_ENABLED:
+            vix_term = metrics.get("vix_term", {})
+            vix9d_ratio = vix_term.get("ratio", 1.0)
+            vix9d_source = vix_term.get("source", "")
+            if vix9d_source != "error" and vix9d_ratio > 0:
+                if vix9d_ratio < CFG.VIX9D_FEAR_SPIKE_RATIO:
+                    # VIX9D << VIX = near-term fear spike, contrarian bullish
+                    vix9d_wt = 0.8
+                    direction_votes["BULLISH"] += vix9d_wt
+                    confirming.append(f"VIX9D: Fear spike (ratio={vix9d_ratio:.3f}, wt={vix9d_wt})")
+                    signals_checked += 1
+                elif vix9d_ratio > CFG.VIX9D_BACKWARDATION_RATIO:
+                    # VIX9D >> VIX = steep backwardation, bearish
+                    vix9d_wt = 0.8
+                    direction_votes["BEARISH"] += vix9d_wt
+                    confirming.append(f"VIX9D: Steep backwardation (ratio={vix9d_ratio:.3f}, wt={vix9d_wt})")
+                    signals_checked += 1
+                elif vix9d_ratio < 0.95:
+                    # Mild contango, slight bullish lean
+                    vix9d_wt = 0.4
+                    direction_votes["BULLISH"] += vix9d_wt
+                    confirming.append(f"VIX9D: Contango (ratio={vix9d_ratio:.3f}, wt={vix9d_wt})")
+                    signals_checked += 1
+
+        # 13. FedWatch — Fed funds futures rate expectations (v29)
+        if CFG.FEDWATCH_ENABLED:
+            fedwatch = metrics.get("fedwatch", {})
+            fw_signal = fedwatch.get("signal", "NEUTRAL")
+            fw_weight = fedwatch.get("weight", 0)
+            if fw_signal in ("BULLISH", "BEARISH") and fw_weight > 0:
+                fw_wt = _apply_sw("fedwatch", fw_weight)
+                direction_votes[fw_signal] += fw_wt
+                confirming.append(f"FedWatch: {fedwatch.get('description', fw_signal)} (wt={fw_wt})")
+                signals_checked += 1
 
         # --- Determine confluence ---
         bull_score = direction_votes["BULLISH"]
@@ -862,7 +906,8 @@ def calc_signal_confluence(metrics: dict) -> dict:
 # =================================================================
 
 def apply_confidence_pipeline(data, metrics, accuracy_tracker, regime, md,
-                              position_suggestion_fn=None, news_info=None):
+                              position_suggestion_fn=None, news_info=None,
+                              signal_weights=None):
     """
     FIXED confidence pipeline (v25.3). Replaces the inline code in main().
 
@@ -901,7 +946,7 @@ def apply_confidence_pipeline(data, metrics, accuracy_tracker, regime, md,
         conf = max(0, min(100, conf + regime_mod))
 
     # Step 3: Signal confluence floor (NEW — the key fix)
-    confluence = calc_signal_confluence(metrics)
+    confluence = calc_signal_confluence(metrics, signal_weights=signal_weights)
     floor = confluence.get("conviction_floor", 0)
 
     # Step 4: Regime flat threshold — must be defined before floor threshold-lift check
@@ -927,10 +972,18 @@ def apply_confidence_pipeline(data, metrics, accuracy_tracker, regime, md,
     # without artificial floors. Confluence data is still logged for analysis.
 
     # Step 5: Position sizing (uses regime threshold, not hardcoded 70)
+    # v29: Pass accuracy stats for Kelly criterion sizing
     if position_suggestion_fn is None:
         from session_utils import position_suggestion
         position_suggestion_fn = position_suggestion
-    contracts, pos_str = position_suggestion_fn(conf, flat_threshold)
+    _acc = accuracy_tracker.get_recent_accuracy() if accuracy_tracker else {}
+    contracts, pos_str = position_suggestion_fn(
+        conf, flat_threshold,
+        win_rate=_acc.get("win_rate", 0) / 100,  # convert % to fraction
+        avg_win=_acc.get("avg_win", 0),
+        avg_loss=_acc.get("avg_loss", 0),
+        total_trades=_acc.get("total", 0),
+    )
 
     # Step 5b: Event-aware position sizing — halve contracts near high-impact news
     if news_info:

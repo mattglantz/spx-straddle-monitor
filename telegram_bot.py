@@ -9,6 +9,7 @@ from __future__ import annotations
 import io
 import time
 import threading
+import webbrowser
 from datetime import time as dtime
 from typing import TYPE_CHECKING
 
@@ -738,7 +739,7 @@ def send_daily_recap(journal: Journal):
                 )
                 expectancy_d = total_pnl_d / len(closed_trades) if closed_trades else 0
                 lines.append(f"`Avg W/L ` +{avg_w:.1f} / -{avg_l:.1f} pts")
-                lines.append(f"`E[trade]` *{'+' if expectancy_d >= 0 else '-'}${abs(expectancy_d):,.0f}*")
+                lines.append(f"`Avg/trd ` *{'+' if expectancy_d >= 0 else '-'}${abs(expectancy_d):,.0f}*")
         except Exception as e:
             logger.debug(f"Daily recap stats computation failed: {e}")
 
@@ -831,7 +832,7 @@ def send_heartbeat(journal: Journal = None, accuracy_tracker=None):
                 f"`Avg W/L ` +{avg_w:.1f} / -{avg_l:.1f} pts"
             )
             lines.append(
-                f"`E[trade]` *{'+' if expectancy_d >= 0 else '-'}${abs(expectancy_d):,.0f}*"
+                f"`Avg/trd ` *{'+' if expectancy_d >= 0 else '-'}${abs(expectancy_d):,.0f}*"
             )
         except Exception as e:
             logger.debug(f"Heartbeat stats computation failed: {e}")
@@ -933,7 +934,7 @@ def send_heartbeat(journal: Journal = None, accuracy_tracker=None):
     if wk_total >= 2:
         e_emoji = "\u2705" if wk_expect >= 0 else "\u274c"
         lines.append(
-            f"{e_emoji} E[trade]: *{'+' if wk_expect >= 0 else '-'}${abs(wk_expect):,.0f}*"
+            f"{e_emoji} Avg/trd: *{'+' if wk_expect >= 0 else '-'}${abs(wk_expect):,.0f}*"
         )
 
     send_telegram("\n".join(lines))
@@ -1048,6 +1049,10 @@ class TelegramCommandListener:
                         self._handle_shadow()
                       elif text.startswith("/config"):
                         self._handle_config(text)
+                      elif text == "/report":
+                        self._handle_report()
+                      elif text == "/dash":
+                        self._handle_dash()
                       elif text == "/help":
                         send_telegram(
                             "*Commands:*\n"
@@ -1063,6 +1068,8 @@ class TelegramCommandListener:
                             "/health -- Bot performance metrics\n"
                             "/week -- Weekly performance roll-up\n"
                             "/month -- Monthly performance roll-up\n"
+                            "/report -- Generate weekly PDF report\n"
+                            "/dash -- Open dashboard in browser\n"
                             "/recap -- Full day recap\n"
                             "/charts -- Chart archive status\n"
                             "/quiet -- Only alert on changes\n"
@@ -1166,14 +1173,13 @@ class TelegramCommandListener:
             send_telegram("No analysis yet -- waiting for first cycle to complete.")
 
     def _handle_risk(self):
-        """Show current risk exposure and distance to daily loss limit."""
+        """Show current risk exposure."""
         stats = self.journal.get_today_stats()
         open_trades = self.journal.get_open_trades()
 
         realized_d = stats['realized'] * CFG.POINT_VALUE
         floating_d = stats['floating'] * CFG.POINT_VALUE
         net_d = stats['net'] * CFG.POINT_VALUE
-        loss_limit = CFG.MAX_DAILY_LOSS  # negative number like -500
 
         # Calculate total exposure
         total_cts = sum(int(t.get("contracts", 1) or 1) for t in open_trades)
@@ -1189,8 +1195,6 @@ class TelegramCommandListener:
             dist = abs(entry - stop) * CFG.POINT_VALUE * cts
             max_risk_d = max(max_risk_d, dist)
 
-        # Distance to loss limit
-        remaining = abs(loss_limit) + net_d  # e.g., 500 + (-200) = 300 remaining
         pct_today = (net_d / CFG.ACCOUNT_SIZE) * 100
 
         lines = [
@@ -1209,8 +1213,6 @@ class TelegramCommandListener:
             f"`Floating ` {'+' if floating_d >= 0 else '-'}${abs(floating_d):,.0f}",
             f"`Net      ` *{'+' if net_d >= 0 else '-'}${abs(net_d):,.0f}*",
             "",
-            "\u2500\u2500\u2500 Limits \u2500\u2500\u2500",
-            f"`Loss Cap ` ${abs(loss_limit):,.0f} ({'+' if remaining >= 0 else '-'}${abs(remaining):,.0f} remaining)",
             f"`Account  ` ${CFG.ACCOUNT_SIZE:,.0f} ({pct_today:+.2f}% today)",
         ])
 
@@ -1294,7 +1296,8 @@ class TelegramCommandListener:
             lines = ["*⚙️ Live Config*", ""]
             for key in sorted(_RELOADABLE_FIELDS.keys()):
                 val = getattr(CFG, key, "?")
-                lines.append(f"`{key}` = {val}")
+                val_str = _escape_telegram_md(str(val))
+                lines.append(f"`{key}` = {val_str}")
             send_telegram("\n".join(lines))
             return
 
@@ -1403,7 +1406,7 @@ class TelegramCommandListener:
             f"`P&L     ` *{'+' if pnl_d >= 0 else '-'}${abs(pnl_d):,.0f}*",
             f"`Best    ` +${best_d:,.0f}",
             f"`Worst   ` -${abs(worst_d):,.0f}",
-            f"`E[trade]` *{'+' if exp_d >= 0 else '-'}${abs(exp_d):,.0f}*",
+            f"`Avg/trd ` *{'+' if exp_d >= 0 else '-'}${abs(exp_d):,.0f}*",
         ]
         # Prior week comparison
         prev_pnl = weekly.get("prev_week_pnl")
@@ -1458,6 +1461,43 @@ class TelegramCommandListener:
             f"`P&L     ` *{'+' if pnl_d >= 0 else '-'}${abs(pnl_d):,.0f}*",
             f"`Best    ` +${best_d:,.0f}",
             f"`Worst   ` -${abs(worst_d):,.0f}",
-            f"`E[trade]` *{'+' if exp_d >= 0 else '-'}${abs(exp_d):,.0f}*",
+            f"`Avg/trd ` *{'+' if exp_d >= 0 else '-'}${abs(exp_d):,.0f}*",
         ]
         send_telegram("\n".join(lines))
+
+    def _handle_report(self):
+        """Generate and send weekly PDF report."""
+        try:
+            from weekly_report import generate_weekly_report
+            send_telegram("Generating weekly report...")
+            report_path = generate_weekly_report(self.journal)
+            if report_path and report_path.exists():
+                url = f"https://api.telegram.org/bot{CFG.TELEGRAM_TOKEN}/sendDocument"
+                with open(report_path, "rb") as f:
+                    resp = requests.post(url, data={"chat_id": CFG.TELEGRAM_CHAT_ID},
+                                         files={"document": f}, timeout=30)
+                if resp.status_code == 200:
+                    send_telegram(f"*\u2705 Weekly report sent*\n{report_path.name}")
+                else:
+                    send_telegram(f"Report generated at `{report_path}` but upload failed.")
+            else:
+                send_telegram("Report generation failed — check logs.")
+        except ImportError:
+            send_telegram("*\u26a0\ufe0f fpdf2 not installed*\nRun: `pip install fpdf2`")
+        except Exception as e:
+            send_telegram(f"*Report error:* `{str(e)[:200]}`")
+
+    def _handle_dash(self):
+        """Open dashboard in browser and confirm via Telegram."""
+        if CFG.DASHBOARD_ENABLED:
+            url = f"http://localhost:{CFG.DASHBOARD_PORT}"
+            webbrowser.open(url)
+            send_telegram(
+                f"*\U0001f4ca Dashboard opened*\n"
+                f"{url}"
+            )
+        else:
+            send_telegram(
+                "*Dashboard is disabled*\n"
+                "Enable with: `/config DASHBOARD_ENABLED true`"
+            )

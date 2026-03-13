@@ -6,8 +6,11 @@ Extracted from market_bot_v26.py.
 
 from __future__ import annotations
 
+import json
 import threading
+import time as _time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import pandas as pd
@@ -310,3 +313,84 @@ class MarketData:
             return df[df.index.date == today]
         except Exception:
             return self.es_1m.tail(390)  # fallback: last ~1 session
+
+
+# =================================================================
+# --- FED FUNDS FUTURES (Feature #9) ---
+# =================================================================
+
+_fedwatch_cache: Dict[str, Any] = {}
+_fedwatch_cache_time: float = 0.0
+
+
+def fetch_fedwatch_probs() -> dict:
+    """
+    Fetch Fed funds rate probabilities from CME FedWatch via yfinance
+    Fed funds futures proxy.
+
+    Uses ZQ (30-Day Fed Fund futures) to derive implied cut/hike probabilities.
+    Caches for FEDWATCH_CACHE_TTL seconds (default 4 hours).
+
+    Returns dict with: cut_prob, hike_prob, hold_prob, prev_cut_prob, prev_hike_prob
+    """
+    global _fedwatch_cache, _fedwatch_cache_time
+
+    if not CFG.FEDWATCH_ENABLED:
+        return {}
+
+    # Check cache
+    if _fedwatch_cache and (_time.time() - _fedwatch_cache_time) < CFG.FEDWATCH_CACHE_TTL:
+        return _fedwatch_cache
+
+    try:
+        # Current Fed funds rate (effective) — approximate from SOFR proxy
+        current_rate = 4.33  # Updated manually or from config; approximate
+
+        # Fetch front-month Fed fund futures (ZQ)
+        # ZQ is priced as 100 - implied rate
+        zq = yf.Ticker("ZQ=F")
+        hist = zq.history(period="10d", interval="1d")
+
+        if hist.empty or len(hist) < 2:
+            logger.warning("FedWatch: insufficient ZQ data")
+            return {}
+
+        # Current implied rate
+        current_close = float(hist["Close"].iloc[-1])
+        prev_close = float(hist["Close"].iloc[-5]) if len(hist) >= 5 else float(hist["Close"].iloc[0])
+
+        implied_rate = 100 - current_close
+        prev_implied = 100 - prev_close
+
+        # Derive probabilities (simplified — each 25bp step)
+        rate_diff = current_rate - implied_rate  # positive = market expects cut
+        prev_diff = current_rate - prev_implied
+
+        # Convert to probabilities (each 25bp movement = ~100% of one cut/hike)
+        cut_prob = max(0, min(100, rate_diff / 0.25 * 100))
+        hike_prob = max(0, min(100, -rate_diff / 0.25 * 100))
+        hold_prob = max(0, 100 - cut_prob - hike_prob)
+
+        prev_cut = max(0, min(100, prev_diff / 0.25 * 100))
+        prev_hike = max(0, min(100, -prev_diff / 0.25 * 100))
+
+        result = {
+            "cut_prob": round(cut_prob, 1),
+            "hike_prob": round(hike_prob, 1),
+            "hold_prob": round(hold_prob, 1),
+            "prev_cut_prob": round(prev_cut, 1),
+            "prev_hike_prob": round(prev_hike, 1),
+            "implied_rate": round(implied_rate, 4),
+            "current_rate": current_rate,
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        }
+
+        _fedwatch_cache = result
+        _fedwatch_cache_time = _time.time()
+        logger.info(f"[FEDWATCH] Cut={cut_prob:.0f}% Hike={hike_prob:.0f}% Hold={hold_prob:.0f}% "
+                    f"(implied {implied_rate:.3f}%)")
+        return result
+
+    except Exception as e:
+        logger.warning(f"FedWatch fetch failed: {e}")
+        return _fedwatch_cache if _fedwatch_cache else {}

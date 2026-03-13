@@ -160,18 +160,51 @@ def is_news_blackout(
 # --- POSITION SIZING ---
 # =================================================================
 
-def position_suggestion(confidence: int, flat_threshold: int = 60) -> Tuple[int, str]:
+def position_suggestion(confidence: int, flat_threshold: int = 60,
+                        win_rate: float = 0.0, avg_win: float = 0.0,
+                        avg_loss: float = 0.0, total_trades: int = 0) -> Tuple[int, str]:
     """
     Map confidence % to a contract tier from CFG.POSITION_TIERS.
 
     Default tiers: 60%+ = 1 ct, 70%+ = 2 ct, 80%+ = 3 ct, 90%+ = 4 ct.
+
+    v29: When KELLY_SIZING_ENABLED, applies half-Kelly fraction to scale
+    the tier thresholds based on rolling edge. Requires min trades before
+    activating. Negative edge reduces all tiers by 1.
     """
     if confidence < flat_threshold:
         return 0, f"NO TRADE (Conf {confidence}% < {flat_threshold}%)"
 
+    tiers = list(CFG.POSITION_TIERS)
+
+    # v29 Kelly criterion adjustment
+    kelly_info = ""
+    if (CFG.KELLY_SIZING_ENABLED
+            and total_trades >= CFG.KELLY_MIN_TRADES
+            and avg_win > 0 and avg_loss > 0):
+        # Kelly fraction: f = (p*b - q) / b where p=win_rate, b=avg_win/avg_loss, q=1-p
+        b = avg_win / avg_loss
+        kelly_full = (win_rate * b - (1 - win_rate)) / b if b > 0 else 0
+        kelly_f = kelly_full * CFG.KELLY_FRACTION  # half-Kelly
+
+        if kelly_f <= 0:
+            # Negative edge — reduce all tiers by 1 contract (floor at 1)
+            tiers = [(t, max(1, c - 1)) for t, c in tiers]
+            kelly_info = f" [Kelly={kelly_f:.2f}, reduced]"
+        elif kelly_f < 0.5:
+            # Small edge — cap at 2 contracts max
+            tiers = [(t, min(c, 2)) for t, c in tiers]
+            kelly_info = f" [Kelly={kelly_f:.2f}, capped@2]"
+        elif kelly_f >= 0.8:
+            # Strong edge — bump high tiers by 1 (cap at 5)
+            tiers = [(t, min(5, c + 1) if c >= 3 else c) for t, c in tiers]
+            kelly_info = f" [Kelly={kelly_f:.2f}, boosted]"
+        else:
+            kelly_info = f" [Kelly={kelly_f:.2f}]"
+
     contracts = 1  # fallback
-    for threshold, cts in sorted(CFG.POSITION_TIERS, reverse=True):
+    for threshold, cts in sorted(tiers, reverse=True):
         if confidence >= threshold:
             contracts = cts
             break
-    return contracts, f"{contracts} ct ({confidence}% conf)"
+    return contracts, f"{contracts} ct ({confidence}% conf{kelly_info})"

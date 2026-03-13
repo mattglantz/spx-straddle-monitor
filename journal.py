@@ -68,6 +68,7 @@ class Journal:
                 "ALTER TABLE trades ADD COLUMN partial_closed INTEGER DEFAULT 0",
                 "ALTER TABLE trades ADD COLUMN stop_updated_at TEXT DEFAULT NULL",
                 "ALTER TABLE trades ADD COLUMN realized_pnl REAL DEFAULT 0.0",
+                "ALTER TABLE trades ADD COLUMN runner_mode INTEGER DEFAULT 0",
             ]:
                 try:
                     conn.execute(col_sql)

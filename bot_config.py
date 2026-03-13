@@ -103,7 +103,6 @@ class Config:
 
     ACCOUNT_SIZE: float = field(default_factory=lambda: _safe_float("ACCOUNT_SIZE", 50000))
     MAX_RISK_PCT: float = field(default_factory=lambda: _safe_float("MAX_RISK_PCT", 2.0))
-    MAX_DAILY_LOSS: float = field(default_factory=lambda: _safe_float("MAX_DAILY_LOSS", -500.0))  # dollars (e.g., -500 = $500 max loss)
     TRAILING_STOP_TRIGGER: float = 10.0
     # Progressive trailing stop levels: list of (float_pnl_threshold, stop_offset_from_entry)
     # When float P&L >= threshold, move stop to entry + offset.
@@ -165,6 +164,70 @@ class Config:
     STOP_CLUSTER_MAX_DIST: float = 30.0  # Max distance (pts) for stop cluster detection
     STOP_CLUSTER_MIN_DIST: float = 2.0   # Min distance (pts) to exclude current price noise
 
+    # --- v29 Feature Toggles ---
+    # Feature #5: VIX9D confluence voting
+    VIX9D_CONFLUENCE_ENABLED: bool = True
+    VIX9D_FEAR_SPIKE_RATIO: float = 0.85   # ratio below this = contrarian bullish
+    VIX9D_BACKWARDATION_RATIO: float = 1.15  # ratio above this = bearish
+
+    # Feature #10: Volatility-scaled targets/stops
+    VOL_SCALED_TARGETS_ENABLED: bool = True
+    VOL_SCALE_BASE: float = 0.80
+    VOL_SCALE_MIN: float = 0.60
+    VOL_SCALE_MAX: float = 1.20
+
+    # Feature #11: Time-based edge decay
+    TIME_DECAY_ENABLED: bool = True
+    TIME_DECAY_LEVELS: list = field(default_factory=lambda: [
+        (0.50, 0.20),  # 50% of time elapsed -> tighten stop 20%
+        (0.75, 0.40),  # 75% of time elapsed -> tighten stop 40%
+    ])
+
+    # Feature #1: Kelly criterion position sizing
+    KELLY_SIZING_ENABLED: bool = False  # off until validated via backtest
+    KELLY_FRACTION: float = 0.5   # half-Kelly (conservative)
+    KELLY_MIN_TRADES: int = 20
+
+    # Feature #2: Runner trailing (ATR-based after partial close)
+    RUNNER_TRAILING_ENABLED: bool = True
+    RUNNER_ATR_MULTIPLIER: float = 1.5
+
+    # Feature #4: Regime-aware entry timing
+    ENTRY_TIMING_ENABLED: bool = False  # off until validated
+    ENTRY_TIMING_MAX_WAIT_BARS: int = 6  # max bars to wait for pullback
+    ENTRY_TIMING_MIN_QUALITY: float = 40.0
+
+    # Feature #12: Re-entry after stop-out
+    REENTRY_ENABLED: bool = False  # off until validated
+    REENTRY_MAX_WAIT_MIN: int = 15
+    REENTRY_ZONE_PTS: float = 3.0
+    REENTRY_STOP_FACTOR: float = 0.75  # tighter stop on re-entry
+
+    # Feature #14: Signal decay / auto weight adjustment
+    SIGNAL_DECAY_ENABLED: bool = False
+    SIGNAL_DECAY_LOOKBACK_DAYS: int = 14
+    SIGNAL_WEIGHT_MIN: float = 0.1
+    SIGNAL_WEIGHT_MAX: float = 2.0
+
+    # Feature #13: Post-trade review feedback loop
+    FEEDBACK_LOOP_ENABLED: bool = False
+    FEEDBACK_MAX_WEIGHT_CHANGE: float = 0.25
+
+    # Feature #15: Session narrative memory
+    SESSION_MEMORY_MAX_CYCLES: int = 20
+    SESSION_MEMORY_TRACK_EVENTS: bool = True
+
+    # Feature #16: Live dashboard
+    DASHBOARD_ENABLED: bool = False
+    DASHBOARD_PORT: int = 8051
+
+    # Feature #18: Weekly PDF report
+    WEEKLY_REPORT_ENABLED: bool = False
+
+    # Feature #9: Fed Funds / FedWatch
+    FEDWATCH_ENABLED: bool = False
+    FEDWATCH_CACHE_TTL: int = 14400  # 4 hours
+
     # --- Shadow Mode ---
     # Set SHADOW_ENABLED=1 and SHADOW_PARAMS='{"flat_threshold": 55}' in .env
     SHADOW_ENABLED: bool = (os.getenv("SHADOW_ENABLED", "0") == "1")
@@ -192,11 +255,22 @@ CONFIG_OVERRIDES_FILE = Path("config_overrides.json")
 _RELOADABLE_FIELDS = {
     "FLAT_THRESHOLDS": dict,
     "RR_MINIMUM": float,
-    "MAX_DAILY_LOSS": float,
     "POSITION_TIERS": list,
     "MAX_OPEN_TRADES": int,
     "TIME_EXIT_SECONDS": int,
     "TRAILING_STOP_LEVELS": list,
+    "VIX9D_CONFLUENCE_ENABLED": bool,
+    "VOL_SCALED_TARGETS_ENABLED": bool,
+    "VOL_SCALE_BASE": float,
+    "TIME_DECAY_ENABLED": bool,
+    "TIME_DECAY_LEVELS": list,
+    "KELLY_SIZING_ENABLED": bool,
+    "RUNNER_TRAILING_ENABLED": bool,
+    "ENTRY_TIMING_ENABLED": bool,
+    "REENTRY_ENABLED": bool,
+    "SIGNAL_DECAY_ENABLED": bool,
+    "FEEDBACK_LOOP_ENABLED": bool,
+    "DASHBOARD_ENABLED": bool,
 }
 
 
@@ -221,7 +295,12 @@ def reload_config() -> dict:
             continue
         expected_type = _RELOADABLE_FIELDS[key]
         try:
-            if expected_type == float:
+            if expected_type == bool:
+                if isinstance(val, str):
+                    val = val.lower() in ("true", "1", "yes")
+                else:
+                    val = bool(val)
+            elif expected_type == float:
                 val = float(val)
             elif expected_type == int:
                 val = int(val)

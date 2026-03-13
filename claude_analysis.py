@@ -25,11 +25,14 @@ _CYCLE_MEMORY_FILE = Path("logs/cycle_memory.json")
 
 class CycleMemory:
     """Stores last N cycle summaries so Claude can track developing setups.
-    Persists to disk so context survives restarts (#11)."""
+    Persists to disk so context survives restarts (#11).
 
-    def __init__(self, max_cycles: int = 5):
-        self.max_cycles = max_cycles
+    v29: Expanded to support session narrative with key events tracking."""
+
+    def __init__(self, max_cycles: int = None):
+        self.max_cycles = max_cycles or CFG.SESSION_MEMORY_MAX_CYCLES
         self.cycles: list = []
+        self.key_events: list = []  # v29: regime changes, level tests, etc.
         self._load()
 
     def _load(self):
@@ -37,23 +40,36 @@ class CycleMemory:
         try:
             if _CYCLE_MEMORY_FILE.exists():
                 data = json.loads(_CYCLE_MEMORY_FILE.read_text(encoding="utf-8"))
-                if isinstance(data, list):
-                    _required = {"time", "verdict", "confidence"}
-                    valid = [c for c in data if isinstance(c, dict) and _required.issubset(c.keys())]
-                    if len(valid) < len(data):
-                        logger.warning(f"CycleMemory: dropped {len(data) - len(valid)} invalid entries")
-                    self.cycles = valid[-self.max_cycles:]
-                    logger.info(f"CycleMemory: loaded {len(self.cycles)} cycles from disk")
+                # v29: support both old format (list) and new format (dict with events)
+                if isinstance(data, dict):
+                    cycles_data = data.get("cycles", [])
+                    self.key_events = data.get("key_events", [])[-50:]  # cap events
+                elif isinstance(data, list):
+                    cycles_data = data
+                    self.key_events = []
+                else:
+                    cycles_data = []
+                _required = {"time", "verdict", "confidence"}
+                valid = [c for c in cycles_data if isinstance(c, dict) and _required.issubset(c.keys())]
+                if len(valid) < len(cycles_data):
+                    logger.warning(f"CycleMemory: dropped {len(cycles_data) - len(valid)} invalid entries")
+                self.cycles = valid[-self.max_cycles:]
+                logger.info(f"CycleMemory: loaded {len(self.cycles)} cycles, {len(self.key_events)} events from disk")
         except Exception as e:
             logger.warning(f"CycleMemory load failed (starting fresh): {e}")
             self.cycles = []
+            self.key_events = []
 
     def _save(self):
         """Persist cycle memory to disk."""
         try:
             _CYCLE_MEMORY_FILE.parent.mkdir(exist_ok=True)
+            data = {
+                "cycles": self.cycles,
+                "key_events": self.key_events[-50:],
+            }
             _CYCLE_MEMORY_FILE.write_text(
-                json.dumps(self.cycles, indent=2), encoding="utf-8"
+                json.dumps(data, indent=2), encoding="utf-8"
             )
         except Exception as e:
             logger.warning(f"CycleMemory save failed: {e}")
@@ -120,6 +136,85 @@ class CycleMemory:
 
     def get_last(self) -> dict:
         return self.cycles[-1] if self.cycles else {}
+
+    # --- v29 Session Narrative (Feature #15) ---
+
+    def record_event(self, event_type: str, description: str, price: float = 0.0):
+        """
+        Record a key session event for narrative tracking.
+
+        event_types: REGIME_CHANGE, LEVEL_TEST, VIX_SPIKE, TRADE_OPEN,
+                     TRADE_CLOSE, BREAKOUT, SWEEP_DETECTED
+        """
+        if not CFG.SESSION_MEMORY_TRACK_EVENTS:
+            return
+
+        now = now_et()
+        event = {
+            "time": now.strftime("%H:%M"),
+            "date": now.strftime("%Y-%m-%d"),
+            "type": event_type,
+            "description": description[:120],
+            "price": round(price, 2) if price else 0,
+        }
+        self.key_events.append(event)
+
+        # Keep only today's events + cap at 50
+        today = now.strftime("%Y-%m-%d")
+        self.key_events = [e for e in self.key_events if e.get("date") == today][-50:]
+        self._save()
+
+    def get_session_narrative(self) -> str:
+        """
+        Build a condensed session narrative from cycles and key events.
+
+        Returns a text block highlighting regime transitions, level tests,
+        and sentiment shifts — much richer than just listing cycles.
+        """
+        if not self.cycles and not self.key_events:
+            return ""
+
+        lines = []
+
+        # Key events summary (most recent 10)
+        today = now_et().strftime("%Y-%m-%d")
+        today_events = [e for e in self.key_events if e.get("date") == today]
+        if today_events:
+            lines.append("SESSION EVENTS:")
+            for e in today_events[-10:]:
+                lines.append(f"  [{e['time']}] {e['type']}: {e['description']}"
+                             + (f" @ {e['price']}" if e['price'] else ""))
+
+        # Cycle narrative (condensed)
+        today_cycles = [c for c in self.cycles if c.get("date") == today]
+        if len(today_cycles) >= 3:
+            # Detect regime transitions
+            verdicts = [c["verdict"] for c in today_cycles]
+            transitions = []
+            for i in range(1, len(verdicts)):
+                if verdicts[i] != verdicts[i - 1]:
+                    transitions.append(
+                        f"{today_cycles[i]['time']}: {verdicts[i-1]} -> {verdicts[i]}"
+                    )
+            if transitions:
+                lines.append(f"VERDICT TRANSITIONS: {', '.join(transitions[-3:])}")
+
+            # Price range and trend
+            prices = [c["price"] for c in today_cycles]
+            hi = max(prices)
+            lo = min(prices)
+            lines.append(
+                f"SESSION RANGE: {lo:.2f} - {hi:.2f} ({hi - lo:.1f} pts) | "
+                f"Current: {prices[-1]:.2f} | Cycles: {len(today_cycles)}"
+            )
+
+        # Include standard cycle memory too
+        standard = self.get_prompt_text()
+        if standard:
+            lines.append("")
+            lines.append(standard)
+
+        return "\n".join(lines)
 
 
 # =================================================================
@@ -214,12 +309,53 @@ def build_review_prompt(closed_trades: list, current_price: float) -> str:
         f"Current ES price (close): {current_price:.2f}\n\n"
         "For each trade, provide a 2-3 sentence lesson: what worked, what didn't, "
         "and what to do differently next time. Focus on signal quality and execution.\n"
+        "For each lesson, also specify an action_type from: "
+        "adjust_weight, avoid_session, tighten_stop, widen_stop, info_only. "
+        "If action_type is adjust_weight, include signal_name (one of: fractal, mtf, "
+        "sweep, opening, delta_levels, key_level, vwap_reversion, bond_leadlag, vix9d) "
+        "and direction (increase or decrease).\n"
         "Then provide an overall \"Today I Learned\" summary (2-3 sentences) "
         "synthesizing the day's key takeaway.\n\n"
         "Respond with ONLY this JSON:\n"
-        "{\"reviews\": [{\"trade_id\": <id>, \"lesson\": \"<2-3 sentences>\"}, ...], "
+        "{\"reviews\": [{\"trade_id\": <id>, \"lesson\": \"<2-3 sentences>\", "
+        "\"action_type\": \"<type>\", \"signal_name\": \"<name or null>\", "
+        "\"direction\": \"<increase|decrease|null>\"}, ...], "
         "\"summary\": \"<Today I Learned summary>\"}"
     )
+
+
+def get_recent_lessons(journal, days: int = 7) -> str:
+    """
+    Query recent trade review lessons and format for Claude prompt (v29 Feature #13).
+    Returns a formatted text block of recent lessons, or empty string if none.
+    """
+    try:
+        import sqlite3
+        with journal._conn() as conn:
+            rows = conn.execute(
+                "SELECT date, lesson, summary FROM trade_reviews "
+                "WHERE date >= date('now', ?) ORDER BY date DESC LIMIT 10",
+                (f"-{days} days",),
+            ).fetchall()
+
+        if not rows:
+            return ""
+
+        lines = ["RECENT LESSONS FROM POST-TRADE REVIEWS (last 7 days):"]
+        seen_dates = set()
+        for r in rows:
+            date = r["date"]
+            if date not in seen_dates:
+                seen_dates.add(date)
+                if r["summary"]:
+                    lines.append(f"  [{date}] {r['summary']}")
+                elif r["lesson"]:
+                    lines.append(f"  [{date}] {r['lesson'][:150]}")
+
+        return "\n".join(lines[:8])  # cap at 8 lines to save tokens
+    except Exception as e:
+        logger.warning(f"get_recent_lessons failed: {e}")
+        return ""
 
 
 # =================================================================
@@ -360,7 +496,7 @@ def _format_mtf_details(mtf: dict) -> str:
     return "  " + " | ".join(parts) if parts else ""
 
 
-def build_analysis_prompt(md: MarketData, metrics: dict, prev_verdict: str, pnl_str: str, accuracy_str: str = "", cycle_memory_text: str = "", calibration_str: str = "") -> str:
+def build_analysis_prompt(md: MarketData, metrics: dict, prev_verdict: str, pnl_str: str, accuracy_str: str = "", cycle_memory_text: str = "", calibration_str: str = "", lessons_text: str = "") -> str:
     """Claude-optimized prompt with fractal recognition + full indicator suite."""
 
     fractal = metrics.get("fractal", {})
@@ -557,6 +693,10 @@ Regime Confidence Modifier: {regime.get('confidence_mod', 0):+d}%
 <cycle_history>
 {cycle_memory_text if cycle_memory_text else "First cycle -- no history yet."}
 </cycle_history>
+
+<recent_lessons>
+{lessons_text if lessons_text else "No recent lessons."}
+</recent_lessons>
 
 <analysis_framework>
 Follow these steps in order using the data sections above. Do not skip any step.

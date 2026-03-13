@@ -9,6 +9,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Tuple
 
+import pandas as pd
+
 from bot_config import logger, CFG, now_et
 import trade_status as ts
 from trade_state import TradeStateMachine, TradeState, TradeEvent, InvalidTransitionError, create_machine
@@ -66,6 +68,56 @@ def close_trade_at_price(trade: dict, close_price: float, journal: 'Journal',
 
     journal.update_trade(trade["id"], outcome, pnl)
     return outcome, pnl, price_used
+
+
+# =================================================================
+# --- TIME-BASED EDGE DECAY (v29 Feature #11) ---
+# =================================================================
+
+def _apply_time_decay_stop(entry: float, current_stop: float,
+                           trade_age_pct: float, long: bool) -> Tuple[float, bool]:
+    """
+    Tighten stop as trade ages — edge decays with time.
+
+    trade_age_pct = trade_age_seconds / TIME_EXIT_SECONDS (0.0 to 1.0+).
+    Only moves stop CLOSER to entry, never further away.
+    Does NOT override trailing stop if trailing stop is already tighter.
+
+    Returns (new_stop, changed).
+    """
+    if not CFG.TIME_DECAY_ENABLED:
+        return current_stop, False
+
+    # Find the applicable decay level
+    tighten_pct = 0.0
+    for age_threshold, decay_pct in sorted(CFG.TIME_DECAY_LEVELS):
+        if trade_age_pct >= age_threshold:
+            tighten_pct = decay_pct
+        else:
+            break
+
+    if tighten_pct <= 0:
+        return current_stop, False
+
+    # Calculate the tightened stop: move stop closer to entry by tighten_pct
+    # of the remaining distance between current_stop and entry
+    stop_distance = abs(current_stop - entry)
+    decay_amount = stop_distance * tighten_pct
+
+    if long:
+        # For longs, stop is below entry -> move it UP (closer to entry)
+        new_stop = current_stop + decay_amount
+        # Only tighten (move up), never loosen
+        if new_stop > current_stop:
+            return round(new_stop * 4) / 4, True  # snap to ES tick
+    else:
+        # For shorts, stop is above entry -> move it DOWN (closer to entry)
+        new_stop = current_stop - decay_amount
+        # Only tighten (move down), never loosen
+        if new_stop < current_stop:
+            return round(new_stop * 4) / 4, True
+
+    return current_stop, False
 
 
 # =================================================================
@@ -144,6 +196,14 @@ def _handle_partial_close(trade: dict, close_price: float, pnl_pts: float,
         stop=new_stop, contracts=remain_cts,
         stop_updated_at=now_et().strftime("%Y-%m-%d %H:%M:%S"),
     )
+    # v29: Enable runner mode — remaining contracts use ATR-based trailing
+    if CFG.RUNNER_TRAILING_ENABLED:
+        try:
+            with journal._conn() as conn:
+                conn.execute("UPDATE trades SET runner_mode=1 WHERE id=?", (trade["id"],))
+                conn.commit()
+        except Exception:
+            pass  # runner_mode column may not exist yet
 
     # Accumulate realized P&L from closed contracts (stored in points, not dollars)
     prev_realized = float(trade.get("realized_pnl", 0) or 0)
@@ -429,9 +489,35 @@ def audit_open_trades(journal: 'Journal', md: 'MarketData') -> Tuple[float, floa
                     _validate_transition(machine, TradeEvent.SCALEOUT)
                     continue
 
+                # v29: Time-based edge decay — tighten stop as trade ages
+                trade_age_pct = trade_age_seconds / effective_exit_time if effective_exit_time > 0 else 0
+                decay_stop, decay_changed = _apply_time_decay_stop(entry, stop, trade_age_pct, long=True)
+                if decay_changed and decay_stop > stop:
+                    stop = decay_stop
+                    journal.update_trade(trade["id"], ts.FLOATING,
+                                         curr_price - entry, decay_stop,
+                                         stop_updated_at=now_et().strftime("%Y-%m-%d %H:%M:%S"))
+                    logger.info(f"Trade {trade['id']}: Time decay tightened stop to {decay_stop:.2f} (age {trade_age_pct:.0%})")
+
                 # Still floating — progressive trailing stop (#4)
                 float_pnl = curr_price - entry
-                new_stop, trail_changed = _calc_trailing_stop(entry, stop, float_pnl, long=True)
+                # v29: Runner mode uses ATR-based trailing for wider breathing room
+                _runner = int(trade.get("runner_mode", 0) or 0)
+                _runner_atr = 0.0
+                if _runner and CFG.RUNNER_TRAILING_ENABLED:
+                    try:
+                        _hourly = md.es_1h
+                        if not _hourly.empty and len(_hourly) >= 14:
+                            _tr = pd.concat([
+                                _hourly["High"] - _hourly["Low"],
+                                (_hourly["High"] - _hourly["Close"].shift(1)).abs(),
+                                (_hourly["Low"] - _hourly["Close"].shift(1)).abs(),
+                            ], axis=1).max(axis=1)
+                            _runner_atr = float(_tr.rolling(14).mean().iloc[-1]) * CFG.RUNNER_ATR_MULTIPLIER
+                    except Exception:
+                        pass
+                new_stop, trail_changed = _calc_trailing_stop(entry, stop, float_pnl, long=True,
+                                                              atr=_runner_atr)
                 if trail_changed:
                     # Determine what level we're at for the message
                     offset = new_stop - entry
@@ -545,9 +631,35 @@ def audit_open_trades(journal: 'Journal', md: 'MarketData') -> Tuple[float, floa
                     _validate_transition(machine, TradeEvent.SCALEOUT)
                     continue
 
+                # v29: Time-based edge decay — tighten stop as trade ages
+                trade_age_pct_s = trade_age_seconds / effective_exit_time if effective_exit_time > 0 else 0
+                decay_stop_s, decay_changed_s = _apply_time_decay_stop(entry, stop, trade_age_pct_s, long=False)
+                if decay_changed_s and decay_stop_s < stop:
+                    stop = decay_stop_s
+                    journal.update_trade(trade["id"], ts.FLOATING,
+                                         entry - curr_price, decay_stop_s,
+                                         stop_updated_at=now_et().strftime("%Y-%m-%d %H:%M:%S"))
+                    logger.info(f"Trade {trade['id']}: Time decay tightened stop to {decay_stop_s:.2f} (age {trade_age_pct_s:.0%})")
+
                 # Still floating — progressive trailing stop (#4)
                 float_pnl = entry - curr_price
-                new_stop, trail_changed = _calc_trailing_stop(entry, stop, float_pnl, long=False)
+                # v29: Runner mode uses ATR-based trailing
+                _runner_s = int(trade.get("runner_mode", 0) or 0)
+                _runner_atr_s = 0.0
+                if _runner_s and CFG.RUNNER_TRAILING_ENABLED:
+                    try:
+                        _hourly_s = md.es_1h
+                        if not _hourly_s.empty and len(_hourly_s) >= 14:
+                            _tr_s = pd.concat([
+                                _hourly_s["High"] - _hourly_s["Low"],
+                                (_hourly_s["High"] - _hourly_s["Close"].shift(1)).abs(),
+                                (_hourly_s["Low"] - _hourly_s["Close"].shift(1)).abs(),
+                            ], axis=1).max(axis=1)
+                            _runner_atr_s = float(_tr_s.rolling(14).mean().iloc[-1]) * CFG.RUNNER_ATR_MULTIPLIER
+                    except Exception:
+                        pass
+                new_stop, trail_changed = _calc_trailing_stop(entry, stop, float_pnl, long=False,
+                                                              atr=_runner_atr_s)
                 if trail_changed:
                     offset = entry - new_stop
                     if offset == 0:

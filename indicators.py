@@ -7,7 +7,6 @@ Each function takes a MarketData instance and returns computed values.
 
 from __future__ import annotations
 
-import calendar
 from datetime import datetime, timedelta, time as dtime
 from typing import TYPE_CHECKING, Tuple
 
@@ -816,116 +815,73 @@ def calc_vix_term_structure(md: MarketData) -> dict:
 
 
 # =================================================================
-# --- OVERNIGHT SESSION ---
+# --- VOLATILITY SCALING RATIO (v29 Feature #10) ---
 # =================================================================
 
-def calc_overnight_session(md: MarketData) -> dict:
-    """Analyze the Globex/overnight session relative to prior RTH close."""
+def calc_vol_scaling_ratio(md: 'MarketData') -> dict:
+    """
+    Ratio of current ATR to 20-day average ATR.
+    >1 = more volatile than normal (widen targets/stops).
+    <1 = quieter than normal (tighten targets/stops).
+    """
     try:
-        df = md.es_today_1m.copy()
-        daily = md.es_daily
-        if df.empty or daily.empty or len(daily) < 2:
-            return {"status": "N/A", "gap": 0, "gap_pct": 0, "gap_type": "N/A",
-                    "overnight_high": 0, "overnight_low": 0, "overnight_range": 0,
-                    "position_in_overnight": "N/A"}
+        # Current ATR from hourly bars (14-period)
+        hourly = getattr(md, "es_1h", pd.DataFrame())
+        if hourly.empty or len(hourly) < 15:
+            return {"current_atr": 0, "avg_atr": 0, "ratio": 1.0, "regime": "NORMAL"}
 
-        prev_close = float(daily.iloc[-2]["Close"])
-        prev_high = float(daily.iloc[-2]["High"])
-        prev_low = float(daily.iloc[-2]["Low"])
-        prev_range = prev_high - prev_low
+        high = hourly["High"]
+        low = hourly["Low"]
+        close = hourly["Close"]
+        tr = pd.concat([
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low - close.shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        current_atr = float(tr.rolling(14).mean().iloc[-1])
 
-        if len(daily) >= 15:
-            tr = pd.concat([
-                daily["High"] - daily["Low"],
-                (daily["High"] - daily["Close"].shift(1)).abs(),
-                (daily["Low"] - daily["Close"].shift(1)).abs()
-            ], axis=1).max(axis=1)
-            atr_raw = tr.rolling(14).mean().iloc[-1]
-            atr = float(atr_raw) if pd.notna(atr_raw) and np.isfinite(atr_raw) else 20.0
+        # 20-day average ATR from daily bars
+        daily = getattr(md, "es_1d", pd.DataFrame())
+        if daily.empty or len(daily) < 21:
+            return {"current_atr": round(current_atr, 2), "avg_atr": 0,
+                    "ratio": 1.0, "regime": "NORMAL"}
+
+        d_high = daily["High"]
+        d_low = daily["Low"]
+        d_close = daily["Close"]
+        d_tr = pd.concat([
+            d_high - d_low,
+            (d_high - d_close.shift(1)).abs(),
+            (d_low - d_close.shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        avg_atr = float(d_tr.rolling(20).mean().iloc[-1])
+
+        if avg_atr <= 0:
+            return {"current_atr": round(current_atr, 2), "avg_atr": 0,
+                    "ratio": 1.0, "regime": "NORMAL"}
+
+        ratio = current_atr / avg_atr
+
+        if ratio > 1.5:
+            regime = "HIGH_VOL"
+        elif ratio > 1.2:
+            regime = "ELEVATED"
+        elif ratio < 0.7:
+            regime = "LOW_VOL"
+        elif ratio < 0.85:
+            regime = "QUIET"
         else:
-            atr = prev_range
-
-        if df.index.tz is not None:
-            df_tz = df.copy()
-            df_tz.index = df_tz.index.tz_convert("America/New_York")
-        else:
-            df_tz = df
-
-        rth_open_time = df_tz.index[0].replace(hour=9, minute=30, second=0)
-        overnight = df_tz[df_tz.index < rth_open_time]
-
-        # Use the actual RTH opening price (first bar at/after 9:30),
-        # not the last pre-market bar's close.  On volatile opens these
-        # can differ by several points, mis-classifying gap type.
-        rth_bars = df_tz[df_tz.index >= rth_open_time]
-        if not rth_bars.empty:
-            rth_open = float(rth_bars["Open"].iloc[0])
-        elif not overnight.empty:
-            rth_open = float(overnight["Close"].iloc[-1])  # RTH not started yet
-        else:
-            rth_open = float(df["Open"].iloc[0])
-        gap = rth_open - prev_close
-
-        gap_pct = (gap / prev_close) * 100 if prev_close > 0 else 0
-        gap_atr = abs(gap) / atr if atr > 0 else 0
-
-        if abs(gap) < atr * 0.1:
-            gap_type = "FLAT OPEN (No Gap)"
-        elif gap > 0 and rth_open > prev_high:
-            gap_type = "GAP UP ABOVE RANGE (True Gap)"
-        elif gap < 0 and rth_open < prev_low:
-            gap_type = "GAP DOWN BELOW RANGE (True Gap)"
-        elif gap > 0:
-            gap_type = "GAP UP (Inside Prior Range)"
-        elif gap < 0:
-            gap_type = "GAP DOWN (Inside Prior Range)"
-        else:
-            gap_type = "UNCHANGED"
-
-        if gap_atr < 0.25:
-            fill_prob = "HIGH (85%+ small gaps fill)"
-        elif gap_atr < 0.5:
-            fill_prob = "MODERATE (65% fill)"
-        elif gap_atr < 1.0:
-            fill_prob = "LOW (40% fill -- likely trend day)"
-        else:
-            fill_prob = "VERY LOW (Large gap -- trend continuation likely)"
-
-        on_high = float(overnight["High"].max()) if not overnight.empty else rth_open
-        on_low = float(overnight["Low"].min()) if not overnight.empty else rth_open
-        on_range = on_high - on_low
-
-        curr = md.current_price
-        if on_range > 0:
-            on_position = (curr - on_low) / on_range * 100
-            if on_position > 80:
-                pos_str = f"NEAR OVERNIGHT HIGH ({on_position:.0f}%)"
-            elif on_position < 20:
-                pos_str = f"NEAR OVERNIGHT LOW ({on_position:.0f}%)"
-            else:
-                pos_str = f"MID-RANGE ({on_position:.0f}%)"
-        else:
-            pos_str = "N/A"
+            regime = "NORMAL"
 
         return {
-            "gap": round(gap, 2),
-            "gap_pct": round(gap_pct, 3),
-            "gap_type": gap_type,
-            "gap_atr_ratio": round(gap_atr, 2),
-            "fill_probability": fill_prob,
-            "overnight_high": round(on_high, 2),
-            "overnight_low": round(on_low, 2),
-            "overnight_range": round(on_range, 2),
-            "position_in_overnight": pos_str,
-            "prev_close": round(prev_close, 2),
+            "current_atr": round(current_atr, 2),
+            "avg_atr": round(avg_atr, 2),
+            "ratio": round(ratio, 3),
+            "regime": regime,
         }
-
     except Exception as e:
-        logger.warning(f"Overnight analysis failed: {e}", exc_info=True)
-        return {"status": "Error", "gap": 0, "gap_pct": 0, "gap_type": "N/A",
-                "overnight_high": 0, "overnight_low": 0, "overnight_range": 0,
-                "position_in_overnight": "N/A", "fill_probability": "N/A",
-                "gap_atr_ratio": 0, "prev_close": 0}
+        logger.warning(f"calc_vol_scaling_ratio failed: {e}")
+        return {"current_atr": 0, "avg_atr": 0, "ratio": 1.0, "regime": "NORMAL"}
 
 
 # =================================================================
@@ -1227,70 +1183,6 @@ def classify_day_type(md: MarketData, ib: dict, structure: dict) -> dict:
         logger.warning(f"Day type classification failed: {e}", exc_info=True)
         return {"type": "ERROR", "description": str(e),
                 "trend_probability": 0, "range_probability": 0}
-
-
-# =================================================================
-# --- WEEKLY CONTEXT ---
-# =================================================================
-
-def calc_weekly_context(md: MarketData) -> dict:
-    """Where are we in the weekly range? Monday vs Friday behavior differs."""
-    try:
-        now = now_et()
-        dow = now.strftime("%A")
-        daily = md.es_daily
-        if daily.empty or len(daily) < 5:
-            return {"day_of_week": dow, "weekly_position": "N/A", "notes": ""}
-
-        monday = (now - timedelta(days=now.weekday())).date()
-        _daily_idx = daily.index.tz_convert("America/New_York") if daily.index.tz is not None else daily.index
-        week_data = daily[_daily_idx.date >= monday]
-        if week_data.empty:
-            week_data = daily.tail(1)
-        week_high = float(week_data["High"].max())
-        week_low = float(week_data["Low"].min())
-        week_range = week_high - week_low
-        curr = md.current_price
-
-        if week_range > 0:
-            position = (curr - week_low) / week_range * 100
-            if position > 80:
-                pos_str = f"NEAR WEEKLY HIGH ({position:.0f}%)"
-            elif position < 20:
-                pos_str = f"NEAR WEEKLY LOW ({position:.0f}%)"
-            else:
-                pos_str = f"MID-WEEK RANGE ({position:.0f}%)"
-        else:
-            pos_str = "N/A"
-
-        notes = []
-        third_friday = 0
-        for day in range(15, 22):
-            try:
-                d = now.replace(day=day)
-                if d.weekday() == 4:
-                    third_friday = day
-                    break
-            except ValueError:
-                continue
-        if abs(now.day - third_friday) <= 4:
-            notes.append("OPEX WEEK: Gamma effects amplified. Pin risk near large strikes.")
-
-        last_day = calendar.monthrange(now.year, now.month)[1]
-        if now.day >= last_day - 2:
-            notes.append("MONTH-END: Institutional rebalancing flows. Possible large MOC imbalances.")
-
-        return {
-            "day_of_week": dow,
-            "weekly_position": pos_str,
-            "week_high": round(week_high, 2),
-            "week_low": round(week_low, 2),
-            "notes": " | ".join(notes) if notes else "No special conditions.",
-        }
-
-    except Exception as e:
-        logger.warning(f"Weekly context failed: {e}", exc_info=True)
-        return {"day_of_week": now_et().strftime("%A"), "weekly_position": "N/A", "notes": ""}
 
 
 # =================================================================
@@ -2840,3 +2732,65 @@ def calc_intraday_vol_regime(md: "MarketData") -> dict:
     except Exception as e:
         logger.warning(f"Intraday vol regime failed: {e}", exc_info=True)
         return _VOL_REGIME_DEFAULT.copy()
+
+
+# =================================================================
+# --- FED FUNDS FUTURES (Feature #9) ---
+# =================================================================
+
+def calc_fedwatch_signal(fedwatch_data: dict) -> dict:
+    """
+    Interpret Fed funds futures data as a directional signal.
+
+    If cut probability increased > 10% in the past week → bullish (easing).
+    If hike probability increased > 10% → bearish (tightening).
+
+    Args:
+        fedwatch_data: dict from fetch_fedwatch_probs() with keys:
+            cut_prob, hike_prob, hold_prob, prev_cut_prob, prev_hike_prob
+
+    Returns:
+        dict with signal, direction, weight, description
+    """
+    if not fedwatch_data or not CFG.FEDWATCH_ENABLED:
+        return {"signal": "NEUTRAL", "direction": 0, "weight": 0,
+                "description": "FedWatch disabled or no data"}
+
+    try:
+        cut_prob = fedwatch_data.get("cut_prob", 0)
+        hike_prob = fedwatch_data.get("hike_prob", 0)
+        prev_cut = fedwatch_data.get("prev_cut_prob", cut_prob)
+        prev_hike = fedwatch_data.get("prev_hike_prob", hike_prob)
+
+        cut_delta = cut_prob - prev_cut
+        hike_delta = hike_prob - prev_hike
+
+        if cut_delta > 10:
+            return {
+                "signal": "BULLISH",
+                "direction": 1,
+                "weight": 0.5,
+                "description": (f"Cut prob +{cut_delta:.0f}% ({prev_cut:.0f}% -> {cut_prob:.0f}%) "
+                                f"— easing expectations rising"),
+            }
+        elif hike_delta > 10:
+            return {
+                "signal": "BEARISH",
+                "direction": -1,
+                "weight": 0.5,
+                "description": (f"Hike prob +{hike_delta:.0f}% ({prev_hike:.0f}% -> {hike_prob:.0f}%) "
+                                f"— tightening expectations rising"),
+            }
+        else:
+            return {
+                "signal": "NEUTRAL",
+                "direction": 0,
+                "weight": 0,
+                "description": (f"Cut {cut_prob:.0f}% (Δ{cut_delta:+.0f}%) | "
+                                f"Hike {hike_prob:.0f}% (Δ{hike_delta:+.0f}%) — no significant shift"),
+            }
+
+    except Exception as e:
+        logger.warning(f"calc_fedwatch_signal failed: {e}")
+        return {"signal": "NEUTRAL", "direction": 0, "weight": 0,
+                "description": f"Error: {e}"}

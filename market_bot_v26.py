@@ -99,6 +99,11 @@ from telegram_bot import (
 from price_monitor import PriceMonitor, _collect_monitor_levels
 from health_metrics import HealthMetrics
 from tape_reader import TapeReader
+from entry_timing import EntryTimer
+from reentry_logic import ReEntryTracker
+from signal_weights import SignalWeightManager
+from market_data import fetch_fedwatch_probs
+from indicators import calc_fedwatch_signal
 
 
 # =================================================================
@@ -219,18 +224,24 @@ def get_sleep_interval(atr_14=None, last_atr=None) -> Tuple[int, str]:
         base = 600           # 10 min
     elif 930 <= t < 960:     # 15:30-16:00 -- closing drive
         base = 300           # 5 min
+    elif 960 <= t < 1020:    # 16:00-17:00 -- post-close
+        base = 900           # 15 min
     elif 240 <= t < 570:     # 4:00-9:30 -- pre-open
         base = 300           # 5 min
     else:                    # overnight/after-hours
-        base = 1800          # 30 min
+        base = 600           # 10 min
 
     # ATR spike override: if ATR jumped 30%+ since last cycle, cut interval in half
     if atr_14 and last_atr and last_atr > 0:
         if atr_14 / last_atr >= 1.3:
             base = max(base // 2, 180)  # floor 3 min
 
-    if t < 570 or t >= 960:
+    if t >= 1020 or t < 240:
         mode = "OVERNIGHT"
+    elif 960 <= t < 1020:
+        mode = "POST-CLOSE"
+    elif t < 570:
+        mode = "PRE-OPEN"
     elif t < 600:
         mode = "OPENING"
     elif t >= 930:
@@ -286,9 +297,13 @@ def main():
     signal_logger = SignalLogger()
     from shadow_mode import ShadowMode
     shadow_mode = ShadowMode(shadow_params=CFG.SHADOW_PARAMS) if CFG.SHADOW_ENABLED else None
-    cycle_memory = CycleMemory(max_cycles=5)
+    cycle_memory = CycleMemory(max_cycles=CFG.SESSION_MEMORY_MAX_CYCLES)
     alert_tier = AlertTier()
     health = HealthMetrics()
+    entry_timer = EntryTimer()
+    reentry_tracker = ReEntryTracker()
+    signal_weight_mgr = SignalWeightManager()
+    _last_weight_update = 0.0
 
     # Initialize IBKR connection
     ibkr = IBKRClient(host=CFG.IBKR_HOST, port=CFG.IBKR_PORT, client_id=CFG.IBKR_CLIENT_ID)
@@ -345,7 +360,7 @@ def main():
             try:
                 test_res = requests.post(test_url, data={
                     "chat_id": CFG.TELEGRAM_CHAT_ID,
-                    "text": f"MARKET BOT v28.5 ONLINE (Claude-Powered)\nGhost P&L | GEX | Flow Scanner | Vol Shift | Divergence | Adaptive Weights\nIBKR: {ibkr.get_status()}"
+                    "text": f"MARKET BOT v28.5 ONLINE (Claude-Powered)\nGEX | Flow Scanner | Vol Shift | Divergence\nIBKR: {ibkr.get_status()}"
                 }, timeout=15)
                 logger.info(f"Telegram response: {test_res.status_code} -- {test_res.text[:300]}")
                 if test_res.status_code == 200:
@@ -385,6 +400,25 @@ def main():
         except Exception as e:
             logger.warning(f"PriceMonitor init failed (non-fatal): {e}")
 
+    # Apply config overrides before checking feature flags
+    from bot_config import reload_config
+    reload_config()
+
+    # Launch live dashboard (v29 Feature #16)
+    if CFG.DASHBOARD_ENABLED:
+        try:
+            import threading as _threading
+            from dashboard import app as dash_app
+            _dash_thread = _threading.Thread(
+                target=dash_app.run,
+                kwargs={"debug": False, "port": CFG.DASHBOARD_PORT, "host": "0.0.0.0"},
+                daemon=True,
+            )
+            _dash_thread.start()
+            logger.info(f"Dashboard launched on http://localhost:{CFG.DASHBOARD_PORT}")
+        except Exception as e:
+            logger.warning(f"Dashboard launch failed (non-fatal): {e}")
+
     # Claude client
     claude_client = anthropic.Anthropic(api_key=CFG.ANTHROPIC_API_KEY)
 
@@ -415,6 +449,28 @@ def main():
             if now.time() >= dtime(16, 55) and (last_recap is None or last_recap.date() < now.date()):
                 if md is not None:
                     _run_post_trade_review(journal, md, claude_client)
+                    # v29 Feature #13: Apply feedback from review to signal weights
+                    if CFG.FEEDBACK_LOOP_ENABLED and CFG.SIGNAL_DECAY_ENABLED:
+                        try:
+                            from claude_analysis import get_recent_lessons
+                            lessons = get_recent_lessons(journal, days=1)
+                            for lesson in lessons:
+                                if lesson.get("action_type") == "adjust_weight":
+                                    signal_weight_mgr.apply_feedback_adjustment(
+                                        lesson.get("signal_name", ""),
+                                        lesson.get("direction", ""),
+                                    )
+                        except Exception as _fb_err:
+                            logger.warning(f"Feedback loop error: {_fb_err}")
+                    # v29 Feature #18: Auto-generate weekly report on Friday
+                    if now.weekday() == 4 and CFG.WEEKLY_REPORT_ENABLED:
+                        try:
+                            from weekly_report import generate_weekly_report
+                            report_path = generate_weekly_report(journal)
+                            if report_path:
+                                send_telegram(f"*\U0001f4ca Weekly report generated*\n{report_path}")
+                        except Exception as _rpt_err:
+                            logger.warning(f"Weekly report generation failed: {_rpt_err}")
                 send_daily_recap(journal)
                 journal.save_daily_stats()  # Persist daily stats for historical tracking
                 health.cleanup(days=30)  # Prune old health metrics
@@ -552,10 +608,46 @@ def main():
             logger.info(f"[{cycle_id}] Data fetch: {ibkr_ms:.0f}ms ({md.data_source})")
 
             # 2. Audit open trades first -- ensures realized P&L is current before loss limit check
-            _pre_audit_open = len(journal.get_open_trades())
+            _pre_audit_open = journal.get_open_trades()
+            _pre_audit_ids = {t["id"] for t in _pre_audit_open}
             realized, floating = audit_open_trades(journal, md)
-            if len(journal.get_open_trades()) < _pre_audit_open:
+            _post_audit_open = journal.get_open_trades()
+            _post_audit_ids = {t["id"] for t in _post_audit_open}
+            if len(_post_audit_open) < len(_pre_audit_open):
                 accuracy_tracker.clear_cache()
+                # v29 Feature #12: Record stop-outs for re-entry tracking
+                if CFG.REENTRY_ENABLED:
+                    _closed_ids = _pre_audit_ids - _post_audit_ids
+                    for _ct in _pre_audit_open:
+                        if _ct["id"] in _closed_ids:
+                            reentry_tracker.record_stopout(_ct, md.current_price)
+            reentry_tracker.cleanup_expired()
+            # v29 Feature #4: Check pending entries from entry timer
+            if CFG.ENTRY_TIMING_ENABLED:
+                _ready_entries = entry_timer.check_pending(md.current_price)
+                for _pe in _ready_entries:
+                    try:
+                        _pe_id = journal.add_trade(
+                            price=_pe.original_price,
+                            verdict=_pe.verdict,
+                            confidence=_pe.confidence,
+                            target=_pe.target,
+                            stop=_pe.stop,
+                            contracts=_pe.contracts,
+                            reasoning=_pe.reasoning[:500],
+                            session=_pe.session,
+                            signals=_pe.signals,
+                        )
+                        send_telegram(
+                            f"*\u23f0 TIMED ENTRY*\n\n"
+                            f"*{_pe.verdict}* ({_pe.confidence}%) | {_pe.contracts} ct\n"
+                            f"`Entry  {_pe.original_price:.2f}`\n"
+                            f"`Target {_pe.target:.2f}`\n"
+                            f"`Stop   {_pe.stop:.2f}`\n"
+                            f"Quality: {_pe.setup_quality:.0f} | Waited {_pe.bars_waited} bars"
+                        )
+                    except Exception as _pe_err:
+                        logger.warning(f"Timed entry failed: {_pe_err}")
             _update_signal_scores(journal, md.current_price)
 
             # 2b. EOD force-close: close ALL remaining open positions at 4:00 PM ET
@@ -615,24 +707,6 @@ def main():
                         )
                 except Exception as e:
                     logger.warning(f"EOD fractal outcome recording error: {e}")
-
-            # 3. Daily loss limit -- includes floating P&L for true risk picture (#1)
-            today_stats = journal.get_today_stats()
-            realized_dollars = today_stats['realized'] * CFG.POINT_VALUE
-            floating_dollars = today_stats['floating'] * CFG.POINT_VALUE
-            net_dollars = realized_dollars + floating_dollars
-            if net_dollars <= CFG.MAX_DAILY_LOSS:
-                logger.warning(f"DAILY LOSS LIMIT HIT (Net: {'+' if net_dollars >= 0 else '-'}${abs(net_dollars):,.0f} | Realized: ${realized_dollars:,.0f} + Float: ${floating_dollars:,.0f}). Pausing until tomorrow.")
-                send_telegram(
-                    f"*DAILY LOSS LIMIT HIT*\n"
-                    f"Realized: {'+' if realized_dollars >= 0 else '-'}${abs(realized_dollars):,.0f}\n"
-                    f"Floating: {'+' if floating_dollars >= 0 else '-'}${abs(floating_dollars):,.0f}\n"
-                    f"Net: *{'+' if net_dollars >= 0 else '-'}${abs(net_dollars):,.0f}*\n"
-                    f"Bot paused until next session."
-                )
-                tomorrow = (now + timedelta(days=1)).replace(hour=5, minute=30, second=0)
-                time.sleep((tomorrow - now).total_seconds())
-                continue
 
             # 3. Compute all indicators from the single data snapshot
             vwap_val, vwap_status, vwap_levels = calc_vwap(md)
@@ -723,6 +797,21 @@ def main():
             bond_leadlag = calc_bond_equity_leadlag(md)
             vol_regime = calc_intraday_vol_regime(md)
 
+            # --- v29 VOLATILITY SCALING ---
+            from indicators import calc_vol_scaling_ratio
+            vol_scaling = calc_vol_scaling_ratio(md)
+
+            # --- v29 FED FUNDS FUTURES (Feature #9) ---
+            fedwatch_data = fetch_fedwatch_probs() if CFG.FEDWATCH_ENABLED else {}
+            fedwatch_signal = calc_fedwatch_signal(fedwatch_data) if fedwatch_data else {}
+
+            # --- v29 SIGNAL WEIGHT UPDATE (Feature #14) — hourly ---
+            if CFG.SIGNAL_DECAY_ENABLED and (time.time() - _last_weight_update) > 3600:
+                _sw_changes = signal_weight_mgr.update_weights()
+                if _sw_changes:
+                    logger.info(f"[SIGNAL DECAY] Weights updated: {_sw_changes}")
+                _last_weight_update = time.time()
+
             # --- v25.2 ADVANCED FEATURES ---
             if _rth_open <= _now_time <= _rth_close:
                 gex_regime = calc_gex_regime(md)
@@ -791,6 +880,8 @@ def main():
                 "vwap_reversion": vwap_reversion,
                 "bond_leadlag": bond_leadlag,
                 "vol_regime": vol_regime,
+                "vol_scaling": vol_scaling,
+                "fedwatch": fedwatch_signal,
             }
 
             # Delta at key levels -- needs metrics dict (VWAP, prior, VPOC, gamma)
@@ -878,7 +969,8 @@ def main():
                     logger.warning("No chart capture — running Claude analysis without chart image.")
 
             # 5. Build prompt and call Claude
-            # Use today_stats (line 347) -- audit_open_trades returns 0,0 when no trades are open
+            # realized & floating already set by audit_open_trades (line 562)
+            today_stats = journal.get_today_stats()
             realized = today_stats["realized"]
             floating = today_stats["floating"]
             pnl_str = f"Advisory P&L: {'+' if realized*CFG.POINT_VALUE >= 0 else '-'}${abs(realized*CFG.POINT_VALUE):,.0f} | Open Trades: {'+' if floating*CFG.POINT_VALUE >= 0 else '-'}${abs(floating*CFG.POINT_VALUE):,.0f}"
@@ -889,9 +981,30 @@ def main():
             )
 
             calibration_str = accuracy_tracker.get_calibration_context()
+            # v29 Feature #13: Inject recent lessons into prompt
+            _lessons_text = ""
+            if CFG.FEEDBACK_LOOP_ENABLED:
+                try:
+                    from claude_analysis import get_recent_lessons
+                    _recent = get_recent_lessons(journal, days=7)
+                    if _recent:
+                        _lessons_text = "\n".join(
+                            f"- [{l['date']}] {l['text']}" for l in _recent[:5]
+                        )
+                except Exception:
+                    pass
+
+            # v29 Feature #15: Include session narrative
+            _memory_text = cycle_memory.get_prompt_text()
+            if CFG.SESSION_MEMORY_TRACK_EVENTS and hasattr(cycle_memory, 'get_session_narrative'):
+                _narrative = cycle_memory.get_session_narrative()
+                if _narrative:
+                    _memory_text += f"\n\nSession Narrative:\n{_narrative}"
+
             prompt = build_analysis_prompt(md, metrics, prev_verdict, pnl_str, accuracy_str,
-                                          cycle_memory_text=cycle_memory.get_prompt_text(),
-                                          calibration_str=calibration_str)
+                                          cycle_memory_text=_memory_text,
+                                          calibration_str=calibration_str,
+                                          lessons_text=_lessons_text)
 
             # --- PASS 1: Primary analysis ---
             # Build message content — include chart image only if available (#12)
@@ -963,6 +1076,7 @@ def main():
                 apply_confidence_pipeline(
                     data, metrics, accuracy_tracker, regime, md,
                     news_info=(is_approaching, event_str, event_dt, event_impact),
+                    signal_weights=signal_weight_mgr.get_weights(),
                 )
             flat_threshold = regime.get("flat_threshold", 60)
 
@@ -1038,10 +1152,16 @@ def main():
                         logger.info(f"[SANITY] Bearish target too close: {target_price:.2f} -> {entry_price - MIN_TARGET_PTS:.2f} (min {MIN_TARGET_PTS} pts)")
                         target_price = entry_price - MIN_TARGET_PTS
 
-                # v28.5: Tighten targets/stops by 20% — backtest showed +21% P&L,
-                # +38% Sharpe, -16% drawdown with 0.8x factor
-                # Skip if ATR override already set optimal distances
-                TARGET_TIGHTEN = 0.80
+                # v29: Volatility-scaled target/stop tightening (was fixed 0.80)
+                # Quiet markets -> tighten more, volatile -> widen
+                if CFG.VOL_SCALED_TARGETS_ENABLED:
+                    _vol_ratio = metrics.get("vol_scaling", {}).get("ratio", 1.0)
+                    TARGET_TIGHTEN = max(CFG.VOL_SCALE_MIN,
+                                         min(CFG.VOL_SCALE_MAX,
+                                             CFG.VOL_SCALE_BASE * _vol_ratio))
+                    TARGET_TIGHTEN = round(TARGET_TIGHTEN, 3)
+                else:
+                    TARGET_TIGHTEN = 0.80
                 if not _atr_overridden and target_price > 0 and stop_price > 0 and entry_price > 0:
                     _old_tp2, _old_sl2 = target_price, stop_price
                     target_price = entry_price + (target_price - entry_price) * TARGET_TIGHTEN
@@ -1051,12 +1171,20 @@ def main():
                         target_price = entry_price + MIN_TARGET_PTS
                     elif not ts.is_long(verdict) and target_price > entry_price - MIN_TARGET_PTS:
                         target_price = entry_price - MIN_TARGET_PTS
+                    # Re-enforce minimum stop distance (8pt floor from backtest sweep)
+                    MIN_STOP_PTS = 8.0
+                    _stop_dist = abs(entry_price - stop_price)
+                    if _stop_dist < MIN_STOP_PTS:
+                        if ts.is_long(verdict):
+                            stop_price = entry_price - MIN_STOP_PTS
+                        else:
+                            stop_price = entry_price + MIN_STOP_PTS
                     target_price = round(target_price * 4) / 4  # snap to ES tick
                     stop_price = round(stop_price * 4) / 4
                     data["target"] = target_price
                     data["invalidation"] = stop_price
                     logger.info(
-                        f"[TIGHTEN 0.8x] TP {_old_tp2:.2f}->{target_price:.2f} "
+                        f"[TIGHTEN {TARGET_TIGHTEN}x] TP {_old_tp2:.2f}->{target_price:.2f} "
                         f"SL {_old_sl2:.2f}->{stop_price:.2f}"
                     )
 
@@ -1158,44 +1286,92 @@ def main():
                             signals=_trade_signals,
                         )
                     else:
-                        try:
-                            _new_trade_id = journal.add_trade(
-                                price=entry_price,
-                                verdict=verdict,
-                                confidence=conf,
-                                target=target_price,
-                                stop=stop_price,
-                                contracts=contracts,
-                                reasoning=data.get("reasoning", "")[:500],
-                                session=session,
-                                signals=_trade_signals,
-                            )
-                            # Record signal for forward-looking scoring
-                            if _new_trade_id:
-                                journal.add_signal_score(
-                                    trade_id=_new_trade_id,
-                                    signal_time=now_et().strftime("%Y-%m-%d %H:%M"),
-                                    price_at_signal=entry_price,
-                                    verdict=verdict,
+                        # v29 Feature #4: Entry timing gate — check setup quality
+                        _enter_now = True
+                        if CFG.ENTRY_TIMING_ENABLED:
+                            _setup_q = entry_timer.calc_setup_quality(metrics, verdict, entry_price)
+                            if not entry_timer.should_enter_immediately(_setup_q):
+                                entry_timer.add_pending(
+                                    verdict=verdict, confidence=conf,
+                                    target=target_price, stop=stop_price,
+                                    contracts=contracts, entry_price=entry_price,
+                                    metrics=metrics, signals=_trade_signals,
+                                    reasoning=data.get("reasoning", "")[:500],
+                                    session=session, setup_quality=_setup_q,
                                 )
-                            arrow = "\U0001f7e2" if ts.is_long(verdict) else "\U0001f534"
-                            send_telegram(
-                                f"*{arrow} ADVISORY TRADE*\n"
-                                f"\n"
-                                f"*{verdict}* ({conf}%) \u2502 {contracts} ct\n"
-                                f"\n"
-                                f"`Entry  {entry_price:.2f}`\n"
-                                f"`Target {target_price:.2f}`\n"
-                                f"`Stop   {stop_price:.2f}`\n"
-                                f"`R:R    {rr:.1f}:1`"
-                            )
-                            logger.info(
-                                f"[ADVISORY] {verdict} {contracts}x ES @ {entry_price:.2f} "
-                                f"| TP {target_price:.2f} | SL {stop_price:.2f} | R:R {rr:.1f}:1"
-                            )
-                        except Exception as _trade_err:
-                            logger.error(f"[TRADE ENTRY FAILED] Journal write error: {_trade_err}")
-                            send_telegram(f"*\u26a0\ufe0f Trade entry failed* — journal error, skipping IBKR order")
+                                send_telegram(
+                                    f"*\u23f3 ENTRY QUEUED*\n\n"
+                                    f"*{verdict}* ({conf}%) quality {_setup_q:.0f}\n"
+                                    f"Waiting for pullback to entry zone"
+                                )
+                                _enter_now = False
+                        if _enter_now:
+                            try:
+                                _new_trade_id = journal.add_trade(
+                                    price=entry_price,
+                                    verdict=verdict,
+                                    confidence=conf,
+                                    target=target_price,
+                                    stop=stop_price,
+                                    contracts=contracts,
+                                    reasoning=data.get("reasoning", "")[:500],
+                                    session=session,
+                                    signals=_trade_signals,
+                                )
+                                # Record signal for forward-looking scoring
+                                if _new_trade_id:
+                                    journal.add_signal_score(
+                                        trade_id=_new_trade_id,
+                                        signal_time=now_et().strftime("%Y-%m-%d %H:%M"),
+                                        price_at_signal=entry_price,
+                                        verdict=verdict,
+                                    )
+                                arrow = "\U0001f7e2" if ts.is_long(verdict) else "\U0001f534"
+                                send_telegram(
+                                    f"*{arrow} ADVISORY TRADE*\n"
+                                    f"\n"
+                                    f"*{verdict}* ({conf}%) \u2502 {contracts} ct\n"
+                                    f"\n"
+                                    f"`Entry  {entry_price:.2f}`\n"
+                                    f"`Target {target_price:.2f}`\n"
+                                    f"`Stop   {stop_price:.2f}`\n"
+                                    f"`R:R    {rr:.1f}:1`"
+                                )
+                                logger.info(
+                                    f"[ADVISORY] {verdict} {contracts}x ES @ {entry_price:.2f} "
+                                    f"| TP {target_price:.2f} | SL {stop_price:.2f} | R:R {rr:.1f}:1"
+                                )
+                            except Exception as _trade_err:
+                                logger.error(f"[TRADE ENTRY FAILED] Journal write error: {_trade_err}")
+                                send_telegram(f"*\u26a0\ufe0f Trade entry failed* — journal error, skipping IBKR order")
+
+            # 8b. v29 Re-entry check (Feature #12) — after stop-out, same signal + price in zone
+            if CFG.REENTRY_ENABLED and not _new_trade_id and len(journal.get_open_trades()) < 2:
+                _reentry = reentry_tracker.check_reentry(md.current_price, verdict, conf)
+                if _reentry:
+                    try:
+                        _re_id = journal.add_trade(
+                            price=_reentry["entry_price"],
+                            verdict=_reentry["verdict"],
+                            confidence=_reentry["confidence"],
+                            target=_reentry["target"],
+                            stop=_reentry["stop"],
+                            contracts=1,
+                            reasoning=_reentry["reason"][:500],
+                            session=session,
+                            signals={},
+                        )
+                        _new_trade_id = _re_id
+                        send_telegram(
+                            f"*\U0001f501 RE-ENTRY*\n\n"
+                            f"*{_reentry['verdict']}* ({_reentry['confidence']}%)\n"
+                            f"`Entry  {_reentry['entry_price']:.2f}`\n"
+                            f"`Target {_reentry['target']:.2f}`\n"
+                            f"`Stop   {_reentry['stop']:.2f}` (tighter)\n"
+                            f"{_reentry['reason']}"
+                        )
+                    except Exception as _re_err:
+                        logger.warning(f"Re-entry trade failed: {_re_err}")
 
             # 9. Send to Telegram (with tiered alert system)
             final_msg, status_line = format_analysis_message(data, metrics, prev_verdict, pnl_str, pos_str)
@@ -1249,6 +1425,19 @@ def main():
                 key_signals=key_signals,
                 data=data,
             )
+
+            # v29 Feature #15: Record session events for narrative memory
+            if CFG.SESSION_MEMORY_TRACK_EVENTS:
+                # Trade opens
+                if _new_trade_id:
+                    cycle_memory.record_event("TRADE_OPEN", f"{verdict} {conf}%", md.current_price)
+                # Regime changes (compare to previous)
+                _curr_regime = regime.get("regime", "N/A")
+                if hasattr(cycle_memory, '_last_regime') and cycle_memory._last_regime != _curr_regime:
+                    cycle_memory.record_event("REGIME_CHANGE",
+                                              f"{cycle_memory._last_regime} -> {_curr_regime}",
+                                              md.current_price)
+                cycle_memory._last_regime = _curr_regime
 
             # Record signal decomposition for this cycle
             try:

@@ -198,7 +198,8 @@ def run_backtest(cache_path: Path = Path("fractal_cache.db"),
                  entry_bar: int | None = None,
                  walk_forward: bool = False,
                  tighten: float = 1.0,
-                 threshold_override: int | None = None) -> BacktestResult:
+                 threshold_override: int | None = None,
+                 stop_floor: float = 6.0) -> BacktestResult:
     """Run the backtest across cached historical days."""
 
     cache = DayCache(cache_path)
@@ -359,10 +360,10 @@ def run_backtest(cache_path: Path = Path("fractal_cache.db"),
             # Derive target and stop from fractal projection
             if "BULL" in final_verdict:
                 target_price = proj.upside_target
-                stop_price = max(proj.downside_target, entry_price - 6.0)
+                stop_price = max(proj.downside_target, entry_price - stop_floor)
             else:
                 target_price = proj.downside_target
-                stop_price = min(proj.upside_target, entry_price + 6.0)
+                stop_price = min(proj.upside_target, entry_price + stop_floor)
 
             # Sanity check
             if "BULL" in final_verdict and target_price <= entry_price:
@@ -927,6 +928,8 @@ if __name__ == "__main__":
                         help="Scale target/stop distance (e.g., 0.8 = 20%% tighter)")
     parser.add_argument("--threshold", type=int, default=None,
                         help="Override flat_threshold (e.g., 55, 65, 75)")
+    parser.add_argument("--stop-floor", type=float, default=6.0,
+                        help="Minimum stop distance in points (default: 6.0)")
     args = parser.parse_args()
 
     if args.walk_forward_report:
@@ -951,6 +954,7 @@ if __name__ == "__main__":
             walk_forward=args.walk_forward if hasattr(args, 'walk_forward') else False,
             tighten=args.tighten,
             threshold_override=args.threshold,
+            stop_floor=args.stop_floor,
         )
         if result.trade_log:
             t = result.trade_log[0]
@@ -987,6 +991,7 @@ if __name__ == "__main__":
         walk_forward=args.walk_forward,
         tighten=args.tighten,
         threshold_override=args.threshold,
+        stop_floor=args.stop_floor,
     )
     print_results(result)
     if args.fractal_report:

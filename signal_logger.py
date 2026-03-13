@@ -85,7 +85,10 @@ class SignalLogger:
                     fractal_in_confluence  INTEGER DEFAULT 0,
                     fractal_agrees_claude  INTEGER DEFAULT NULL,
                     correlated_stack_count INTEGER DEFAULT 0,
-                    correlated_stack_dir   TEXT
+                    correlated_stack_dir   TEXT,
+                    -- v29 additions
+                    vix9d_ratio            REAL,
+                    vol_scale_ratio        REAL
                 )
             """)
             conn.execute(
@@ -105,6 +108,8 @@ class SignalLogger:
                 ("fractal_in_confluence", "INTEGER DEFAULT 0"),
                 ("fractal_agrees_claude", "INTEGER DEFAULT NULL"),
                 ("correlated_stack_count", "INTEGER DEFAULT 0"),
+                ("vix9d_ratio", "REAL"),
+                ("vol_scale_ratio", "REAL"),
                 ("correlated_stack_dir", "TEXT"),
             ]:
                 try:
@@ -226,7 +231,8 @@ class SignalLogger:
                         confluence_override, confluence_bull_score, confluence_bear_score,
                         confluence_signals, fractal_in_confluence,
                         fractal_agrees_claude,
-                        correlated_stack_count, correlated_stack_dir
+                        correlated_stack_count, correlated_stack_dir,
+                        vix9d_ratio, vol_scale_ratio
                     ) VALUES (
                         ?, ?, ?,
                         ?, ?, ?,
@@ -247,6 +253,7 @@ class SignalLogger:
                         ?, ?, ?,
                         ?, ?,
                         ?,
+                        ?, ?,
                         ?, ?
                     )
                 """, (
@@ -294,6 +301,8 @@ class SignalLogger:
                     fractal_agrees,
                     corr_stack_count,
                     corr_stack_dir,
+                    metrics.get("vix_term", {}).get("ratio"),
+                    metrics.get("vol_scaling", {}).get("ratio"),
                 ))
                 conn.commit()
         except Exception:

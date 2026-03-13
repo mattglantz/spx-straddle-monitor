@@ -786,6 +786,8 @@ class DayCache:
                 PRIMARY KEY (date, bar_idx))""")
             conn.execute("""CREATE TABLE IF NOT EXISTS bars_1m_compressed (
                 date TEXT PRIMARY KEY, closes BLOB, bar_count INTEGER)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS backfill_meta (
+                key TEXT PRIMARY KEY, value TEXT)""")
             conn.commit()
 
     def has_date(self, date_str):
@@ -906,32 +908,59 @@ class DayCache:
 # --- BULK BACKFILL (TIER 1) ---
 # =================================================================
 
+def _backfill_fetch_chunk(ibkr, cache, chunk_i, is_cont, contract):
+    """Fetch a single 60-day chunk from IBKR and store new days in cache.
+    Returns number of new days added."""
+    from ib_insync import util
+    import time as _time
+
+    end_dt = now_et().replace(tzinfo=None) - timedelta(days=60 * chunk_i)
+    end_str = "" if (is_cont and chunk_i == 0) else end_dt.strftime("%Y%m%d-%H:%M:%S")
+    logger.info(f"  Chunk {chunk_i+1}: 60D ending {end_str[:8] if end_str else 'latest'}...")
+
+    fetch_contract = contract
+    if is_cont and chunk_i > 0:
+        fetch_contract = ibkr._contracts.get("ES") or contract
+        end_str = end_dt.strftime("%Y%m%d-%H:%M:%S")
+
+    bars = ibkr.ib.reqHistoricalData(
+        fetch_contract, endDateTime=end_str, durationStr="60 D",
+        barSizeSetting="5 mins", whatToShow="TRADES",
+        useRTH=False, formatDate=1)
+    if not bars:
+        return -1  # signal no data
+
+    df = util.df(bars)
+    df.set_index("date", inplace=True)
+    df.index = pd.to_datetime(df.index)
+    df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"}, inplace=True)
+    if df.index.tz is not None:
+        df.index = df.index.tz_convert("America/New_York")
+    df["Date"] = df.index.date
+
+    prev_close = 0.0
+    chunk_count = 0
+    for d in sorted(df["Date"].unique()):
+        date_str = str(d)
+        day_df = df[df["Date"] == d]
+        if not day_df.empty and len(day_df) >= 20:
+            if not cache.has_date(date_str):
+                cache.store_day(date_str, day_df, prev_close=prev_close)
+                chunk_count += 1
+            prev_close = float(day_df["Close"].iloc[-1])
+
+    return chunk_count
+
+
 def backfill_from_ibkr(ibkr, cache, target_days=2000):
     current_count = cache.get_day_count()
     if current_count >= target_days:
         logger.info(f"Fractal cache: {current_count} days (target {target_days}). Skip backfill.")
         return current_count
 
-    logger.info(f"Fractal backfill: {current_count} → {target_days} days...")
     if not ibkr or not ibkr.connected:
         logger.warning("Backfill: IBKR not connected.")
         return current_count
-
-    import time as _time
-    total_fetched = 0
-    chunks = (target_days - current_count) // 40 + 1
-    zero_chunks = 0
-
-    # Prefer continuous futures (ES_CONT) for deep history — goes back 2+ years
-    # Fall back to front month (ES) which only has ~8 months
-    contract = ibkr._contracts.get("ES_CONT") or ibkr._contracts.get("ES")
-    if not contract:
-        logger.warning("Backfill: No ES contract available.")
-        return current_count
-    is_cont = "ES_CONT" in ibkr._contracts
-    contract_label = "ES continuous" if is_cont else getattr(contract, 'localSymbol', 'ES')
-    max_chunks = 50 if is_cont else 15  # Continuous = 5+ years, front month = ~8 months
-    logger.info(f"  Using {contract_label} (max {max_chunks} chunks)")
 
     try:
         from ib_insync import util
@@ -939,52 +968,62 @@ def backfill_from_ibkr(ibkr, cache, target_days=2000):
         logger.warning("Backfill: ib_insync not available — cannot backfill")
         return current_count
 
+    import time as _time
+
+    # Check if deep backfill was already completed in a previous session
+    deep_done = False
+    with cache._conn() as conn:
+        try:
+            row = conn.execute(
+                "SELECT value FROM backfill_meta WHERE key='deep_backfill_done'"
+            ).fetchone()
+            if row:
+                deep_done = True
+        except Exception:
+            pass  # table may not exist in old DBs
+
+    # Prefer continuous futures for deep history, fall back to front month
+    contract = ibkr._contracts.get("ES_CONT") or ibkr._contracts.get("ES")
+    if not contract:
+        logger.warning("Backfill: No ES contract available.")
+        return current_count
+    is_cont = "ES_CONT" in ibkr._contracts
+    contract_label = "ES continuous" if is_cont else getattr(contract, 'localSymbol', 'ES')
+
+    if deep_done:
+        # --- INCREMENTAL MODE: only fetch recent data (1 chunk = 60 days) ---
+        logger.info(f"Fractal cache: {current_count} days. Fetching recent data only...")
+        try:
+            new_days = _backfill_fetch_chunk(ibkr, cache, 0, is_cont, contract)
+            final = cache.get_day_count()
+            if new_days > 0:
+                logger.info(f"Incremental backfill: +{new_days} new days (total {final})")
+            else:
+                logger.info(f"Fractal cache up to date ({final} days).")
+            return final
+        except Exception as e:
+            logger.warning(f"Incremental backfill failed: {e}")
+            return current_count
+
+    # --- DEEP BACKFILL MODE: first time, fetch all available history ---
+    logger.info(f"Fractal backfill: {current_count} → {target_days} days...")
+    max_chunks = 50 if is_cont else 15
+    logger.info(f"  Using {contract_label} (max {max_chunks} chunks)")
+
+    total_fetched = 0
+    chunks = (target_days - current_count) // 40 + 1
+    zero_chunks = 0
+
     for chunk_i in range(min(chunks, max_chunks)):
         try:
-            end_dt = now_et().replace(tzinfo=None) - timedelta(days=60 * chunk_i)
-            # ContFuture doesn't allow endDateTime — use empty string for latest data
-            end_str = "" if (is_cont and chunk_i == 0) else end_dt.strftime("%Y%m%d-%H:%M:%S")
-            logger.info(f"  Chunk {chunk_i+1}: 60D ending {end_str[:8] if end_str else 'latest'}...")
-
-            # For continuous contracts, IBKR doesn't allow endDateTime at all
-            # Use front-month ES for chunked backfill if continuous fails on chunk > 0
-            fetch_contract = contract
-            if is_cont and chunk_i > 0:
-                # Fall back to front-month for historical chunks with endDateTime
-                fetch_contract = ibkr._contracts.get("ES") or contract
-                end_str = end_dt.strftime("%Y%m%d-%H:%M:%S")
-
-            bars = ibkr.ib.reqHistoricalData(
-                fetch_contract, endDateTime=end_str, durationStr="60 D",
-                barSizeSetting="5 mins", whatToShow="TRADES",
-                useRTH=False, formatDate=1)
-            if not bars:
+            chunk_count = _backfill_fetch_chunk(ibkr, cache, chunk_i, is_cont, contract)
+            if chunk_count < 0:
                 logger.info(f"  No more data at chunk {chunk_i+1}.")
                 break
-
-            df = util.df(bars)
-            df.set_index("date", inplace=True)
-            df.index = pd.to_datetime(df.index)
-            df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"}, inplace=True)
-            if df.index.tz is not None:
-                df.index = df.index.tz_convert("America/New_York")
-            df["Date"] = df.index.date
-
-            prev_close = 0.0
-            chunk_count = 0
-            for d in sorted(df["Date"].unique()):
-                date_str = str(d)
-                day_df = df[df["Date"] == d]
-                if not day_df.empty and len(day_df) >= 20:
-                    if not cache.has_date(date_str):
-                        cache.store_day(date_str, day_df, prev_close=prev_close)
-                        chunk_count += 1; total_fetched += 1
-                    prev_close = float(day_df["Close"].iloc[-1])
-
+            total_fetched += chunk_count
             logger.info(f"  Chunk {chunk_i+1}: +{chunk_count} days")
 
-            # Early exit: only start counting consecutive empties after we've pushed
-            # past the already-cached recent data (first 6 chunks = ~360 calendar days)
+            # Early exit: only count consecutive empties past cached range
             if chunk_count == 0:
                 if chunk_i >= 6:
                     zero_chunks += 1
@@ -1001,8 +1040,16 @@ def backfill_from_ibkr(ibkr, cache, target_days=2000):
             logger.warning(f"  Chunk {chunk_i+1} failed: {e}")
             _time.sleep(5)
 
+    # Mark deep backfill as done so future restarts only do incremental
+    with cache._conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO backfill_meta (key, value) VALUES (?, ?)",
+            ("deep_backfill_done", now_et().strftime("%Y-%m-%d %H:%M"))
+        )
+        conn.commit()
+
     final = cache.get_day_count()
-    logger.info(f"Backfill done: {final} days (+{total_fetched} new)")
+    logger.info(f"Backfill done: {final} days (+{total_fetched} new). Deep backfill marked complete.")
     return final
 
 
