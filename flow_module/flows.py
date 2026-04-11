@@ -46,21 +46,28 @@ class FlowAggregator:
     """
     Runs all flow trackers and produces a weighted composite signal.
 
-    Weighting reflects the estimated AUM and market impact of each flow:
-    - Rebalancing: 30% (trillions in AUM, very predictable timing)
-    - Vol Control:  25% (hundreds of billions, mechanical)
-    - CTA:          20% (hundreds of billions, trigger-based)
-    - Buyback:      15% (consistent but spread out)
-    - OpEx:         10% (affects vol regime more than direction)
+    IMPORTANT: Only active flows get weight. A flow that returns ~0
+    (e.g., pension rebalancing mid-month) is excluded from the composite
+    entirely — its weight is redistributed to the flows that ARE active.
+    This prevents dead signals from diluting live ones.
+
+    Base importance when active (used for redistribution):
+    - Rebalancing: 3.0 (trillions in AUM, very predictable timing)
+    - Vol Control:  2.5 (hundreds of billions, mechanical)
+    - CTA:          2.0 (hundreds of billions, trigger-based)
+    - Buyback:      1.5 (consistent but spread out)
     """
 
-    WEIGHTS = {
-        "rebalance": 0.30,
-        "vol_control": 0.25,
-        "cta": 0.20,
-        "buyback": 0.15,
-        "opex": 0.10,
+    # Relative importance — only used to distribute weight among ACTIVE flows
+    IMPORTANCE = {
+        "rebalance": 3.0,
+        "vol_control": 2.5,
+        "cta": 2.0,
+        "buyback": 1.5,
     }
+
+    # A flow must exceed this absolute signal to be considered "active"
+    ACTIVE_THRESHOLD = 10.0
 
     def __init__(self, cfg: FlowConfig):
         self.cfg = cfg
@@ -86,20 +93,30 @@ class FlowAggregator:
         vol_sig = self.vol_control.evaluate(store)
         buyback_sig = self.buyback.evaluate()
 
-        # Compute weighted composite
-        # OpEx is non-directional (PIN/UNWIND), so we only use it as
-        # a vol-regime modifier, not a directional signal
-        directional_signals = {
+        # Collect directional signals
+        # OpEx is non-directional (PIN/UNWIND) — used as a modifier only
+        all_signals = {
             "rebalance": rebal_sig.signal,
             "vol_control": vol_sig.signal,
             "cta": cta_sig.signal,
             "buyback": buyback_sig.signal,
         }
 
-        weighted_sum = sum(
-            sig * self.WEIGHTS[name]
-            for name, sig in directional_signals.items()
-        )
+        # Only flows with |signal| above threshold participate in composite
+        active_signals = {
+            name: sig for name, sig in all_signals.items()
+            if abs(sig) >= self.ACTIVE_THRESHOLD
+        }
+
+        if active_signals:
+            # Distribute weight proportionally among active flows only
+            total_importance = sum(self.IMPORTANCE[n] for n in active_signals)
+            weighted_sum = sum(
+                sig * (self.IMPORTANCE[name] / total_importance)
+                for name, sig in active_signals.items()
+            )
+        else:
+            weighted_sum = 0.0
 
         # OpEx modifier: during UNWIND phase, amplify signals (trends run further)
         # During PIN phase, dampen signals (mean-reversion dominates)
@@ -118,7 +135,7 @@ class FlowAggregator:
         else:
             net_direction = "NEUTRAL"
 
-        conviction = self._classify_conviction(net_signal, directional_signals)
+        conviction = self._classify_conviction(net_signal, active_signals)
 
         # Which flows are active (non-zero signal)?
         active = []
@@ -152,12 +169,14 @@ class FlowAggregator:
             headline=headline,
         )
 
+        active_names = list(active_signals.keys()) if active_signals else ["none"]
         log.info(
             f"Flow Snapshot: net={net_signal:+.0f} ({net_direction}) "
             f"conviction={conviction} | "
             f"rebal={rebal_sig.signal:+.0f} cta={cta_sig.signal:+.0f} "
             f"vol={vol_sig.signal:+.0f} buyback={buyback_sig.signal:+.0f} "
-            f"opex={opex_sig.phase}"
+            f"opex={opex_sig.phase} | "
+            f"weighted={','.join(active_names)}"
         )
 
         return snapshot
