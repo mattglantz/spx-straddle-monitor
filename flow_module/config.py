@@ -111,4 +111,16 @@ QUAD_WITCHING = [
     "2026-03-20", "2026-06-19", "2026-09-18", "2026-12-18",
 ]
 
+# ── Economic Events (FOMC, CPI, NFP for seasonality) ───────
+ECONOMIC_EVENTS = [
+    ("2025-01-29", "FOMC"), ("2025-03-19", "FOMC"),
+    ("2025-05-07", "FOMC"), ("2025-06-18", "FOMC"),
+    ("2025-07-30", "FOMC"), ("2025-09-17", "FOMC"),
+    ("2025-10-29", "FOMC"), ("2025-12-10", "FOMC"),
+    ("2026-01-28", "FOMC"), ("2026-03-18", "FOMC"),
+    ("2026-05-06", "FOMC"), ("2026-06-17", "FOMC"),
+    ("2026-07-29", "FOMC"), ("2026-09-16", "FOMC"),
+    ("2026-10-28", "FOMC"), ("2026-12-09", "FOMC"),
+]
+
 # Month-end dates (last business day) — generated dynamically in rebalance module

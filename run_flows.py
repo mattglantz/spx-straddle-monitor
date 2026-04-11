@@ -104,7 +104,17 @@ async def flow_loop(args):
 
             log.info(f"Live ES: {store.live_price:.2f}, VIX: {store.live_vix:.1f}")
             log.info(f"Historical bars: {len(store.daily_bars)}")
+
+            # Initial GEX fetch
+            gex_refresh_interval = 600  # 10 minutes between GEX fetches
+            log.info("Fetching initial GEX data (options chain)...")
+            try:
+                await aggregator.gex.fetch_and_calculate(ib, store.live_price)
+            except Exception as e:
+                log.warning(f"Initial GEX fetch failed: {e}")
+
             log.info("Entering flow analysis loop...")
+            cycles_since_gex = 0
 
             # Main loop
             while ib.isConnected():
@@ -113,13 +123,36 @@ async def flow_loop(args):
                 if store.live_price > 0:
                     store.append_today(store.live_price)
 
+                # Periodic GEX refresh
+                cycles_since_gex += refresh
+                if cycles_since_gex >= gex_refresh_interval:
+                    cycles_since_gex = 0
+                    log.info("Refreshing GEX data...")
+                    try:
+                        await aggregator.gex.fetch_and_calculate(
+                            ib, store.live_price)
+                    except Exception as e:
+                        log.warning(f"GEX refresh failed: {e}")
+
                 # Run flow analysis
                 snapshot = aggregator.evaluate(store)
                 set_snapshot(snapshot)
 
                 # Print summary to console
+                gex_line = ""
+                if snapshot.gex and not snapshot.gex.stale:
+                    gex_line = (f"  GEX:       {snapshot.gex.signal:+.0f} "
+                                f"({snapshot.gex.gamma_regime}) "
+                                f"flip={snapshot.gex.gamma_flip_level:.0f}")
+                seasonal_line = ""
+                if snapshot.seasonality:
+                    seasonal_line = (f"  Seasonal:  {snapshot.seasonality.signal:+.0f} "
+                                     f"({snapshot.seasonality.bias_direction})")
+
                 log.info(f"\n{'='*60}")
                 log.info(f"  {snapshot.headline}")
+                if gex_line:
+                    log.info(gex_line)
                 log.info(f"  Rebalance: {snapshot.rebalance.signal:+.0f} "
                          f"({snapshot.rebalance.flow_direction})")
                 log.info(f"  OpEx:      {snapshot.opex.phase} "
@@ -130,6 +163,8 @@ async def flow_loop(args):
                          f"({snapshot.vol_control.flow_direction})")
                 log.info(f"  Buyback:   {snapshot.buyback.signal:+.0f} "
                          f"({snapshot.buyback.blackout_phase})")
+                if seasonal_line:
+                    log.info(seasonal_line)
                 log.info(f"  NET:       {snapshot.net_signal:+.0f} "
                          f"({snapshot.net_direction}, {snapshot.conviction})")
                 log.info(f"{'='*60}")

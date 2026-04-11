@@ -201,11 +201,11 @@ def build_layout() -> html.Div:
                 ], width=12),
             ], className="mb-3"),
 
-            # Five flow cards
+            # Flow cards
             html.Div(id="flow-cards"),
 
-            # CTA Moving Average levels table
-            html.Div(id="cta-detail"),
+            # Detail tables (CTA levels, GEX strikes, seasonal effects)
+            html.Div(id="detail-tables"),
 
         ], fluid=True, style={
             "backgroundColor": "#010409",
@@ -224,7 +224,7 @@ def register_callbacks(app: dash.Dash):
             Output("flow-timestamp", "children"),
             Output("net-gauge", "figure"),
             Output("flow-cards", "children"),
-            Output("cta-detail", "children"),
+            Output("detail-tables", "children"),
         ],
         Input("flow-refresh", "n_intervals"),
     )
@@ -251,74 +251,163 @@ def register_callbacks(app: dash.Dash):
         # Net gauge
         net_fig = _gauge_figure(snap.net_signal, "NET STRUCTURAL FLOW")
 
-        # Flow cards
-        cards = dbc.Row([
-            # Row 1: Rebalance + OpEx
-            dbc.Col([
-                _flow_card(
-                    "Pension Rebalancing",
-                    snap.rebalance.signal,
-                    snap.rebalance.flow_direction,
-                    snap.rebalance.description,
-                    f"MTD: {snap.rebalance.mtd_return_pct:+.1f}% | "
-                    f"QTD: {snap.rebalance.qtd_return_pct:+.1f}% | "
-                    f"Days to EOM: {snap.rebalance.days_to_month_end}"
-                ),
-            ], md=6, sm=12),
-            dbc.Col([
-                _opex_card(snap),
-            ], md=6, sm=12),
-        ]), dbc.Row([
+        # Flow cards — build rows
+        gex = snap.gex
+        seasonal = snap.seasonality
+
+        cards = html.Div([
+            # Row 1: GEX + OpEx (the two gamma/vol signals)
+            dbc.Row([
+                dbc.Col([
+                    _gex_card(snap) if gex else _flow_card(
+                        "GEX (Gamma Exposure)", 0, "NEUTRAL",
+                        "Waiting for options chain data...", ""),
+                ], md=6, sm=12),
+                dbc.Col([
+                    _opex_card(snap),
+                ], md=6, sm=12),
+            ]),
             # Row 2: CTA + Vol Control
-            dbc.Col([
-                _flow_card(
-                    "CTA Trend-Following",
-                    snap.cta.signal,
-                    snap.cta.flow_direction,
-                    snap.cta.description,
-                    f"Nearest trigger: {snap.cta.nearest_trigger}"
-                ),
-            ], md=6, sm=12),
-            dbc.Col([
-                _flow_card(
-                    "Vol-Control / Risk Parity",
-                    snap.vol_control.signal,
-                    snap.vol_control.flow_direction,
-                    snap.vol_control.description,
-                    f"1M RV: {snap.vol_control.short_rv:.1f}% | "
-                    f"3M RV: {snap.vol_control.long_rv:.1f}% | "
-                    f"RV RoC: {snap.vol_control.rv_roc:+.1f}%/wk"
-                ),
-            ], md=6, sm=12),
-        ]), dbc.Row([
-            # Row 3: Buyback
-            dbc.Col([
-                _flow_card(
-                    "Corporate Buybacks",
-                    snap.buyback.signal,
-                    "BUY" if snap.buyback.signal > 10 else
-                    ("SELL" if snap.buyback.signal < -10 else "NEUTRAL"),
-                    snap.buyback.description,
-                    f"Est. daily flow: ${snap.buyback.estimated_daily_flow_b:.1f}B | "
-                    f"Phase: {snap.buyback.blackout_phase}"
-                ),
-            ], md=6, sm=12),
-            dbc.Col([
-                # Active flows summary
-                _summary_card(snap),
-            ], md=6, sm=12),
+            dbc.Row([
+                dbc.Col([
+                    _flow_card(
+                        "CTA Trend-Following",
+                        snap.cta.signal,
+                        snap.cta.flow_direction,
+                        snap.cta.description,
+                        f"Nearest trigger: {snap.cta.nearest_trigger}"
+                    ),
+                ], md=6, sm=12),
+                dbc.Col([
+                    _flow_card(
+                        "Vol-Control / Risk Parity",
+                        snap.vol_control.signal,
+                        snap.vol_control.flow_direction,
+                        snap.vol_control.description,
+                        f"1M RV: {snap.vol_control.short_rv:.1f}% | "
+                        f"3M RV: {snap.vol_control.long_rv:.1f}% | "
+                        f"RV RoC: {snap.vol_control.rv_roc:+.1f}%/wk"
+                    ),
+                ], md=6, sm=12),
+            ]),
+            # Row 3: Rebalance + Buyback
+            dbc.Row([
+                dbc.Col([
+                    _flow_card(
+                        "Pension Rebalancing",
+                        snap.rebalance.signal,
+                        snap.rebalance.flow_direction,
+                        snap.rebalance.description,
+                        f"MTD: {snap.rebalance.mtd_return_pct:+.1f}% | "
+                        f"QTD: {snap.rebalance.qtd_return_pct:+.1f}% | "
+                        f"Days to EOM: {snap.rebalance.days_to_month_end}"
+                    ),
+                ], md=6, sm=12),
+                dbc.Col([
+                    _flow_card(
+                        "Corporate Buybacks",
+                        snap.buyback.signal,
+                        "BUY" if snap.buyback.signal > 10 else
+                        ("SELL" if snap.buyback.signal < -10 else "NEUTRAL"),
+                        snap.buyback.description,
+                        f"Est. daily flow: ${snap.buyback.estimated_daily_flow_b:.1f}B | "
+                        f"Phase: {snap.buyback.blackout_phase}"
+                    ),
+                ], md=6, sm=12),
+            ]),
+            # Row 4: Seasonality + Summary
+            dbc.Row([
+                dbc.Col([
+                    _seasonality_card(snap) if seasonal else _flow_card(
+                        "Seasonality", 0, "NEUTRAL", "Loading...", ""),
+                ], md=6, sm=12),
+                dbc.Col([
+                    _summary_card(snap),
+                ], md=6, sm=12),
+            ]),
         ])
 
-        # CTA MA detail
-        cta_detail = _build_cta_table(snap)
+        # Detail tables
+        detail = html.Div([
+            _build_cta_table(snap),
+            _build_gex_table(snap),
+            _build_seasonal_table(snap),
+        ])
 
-        return headline, ts, net_fig, cards, cta_detail
+        return headline, ts, net_fig, cards, detail
+
+
+def _gex_card(snap: FlowSnapshot) -> dbc.Card:
+    """Card for GEX gamma exposure."""
+    gex = snap.gex
+    if gex is None:
+        return _flow_card("GEX (Gamma Exposure)", 0, "NEUTRAL",
+                          "Waiting for options data...", "")
+
+    regime_color = {
+        "POSITIVE": "#00c853", "NEGATIVE": "#ff1744", "NEUTRAL": "#ffc107",
+        "UNKNOWN": "#78909c",
+    }.get(gex.gamma_regime, "#78909c")
+
+    return dbc.Card([
+        dbc.CardHeader([
+            html.Span("GEX (Gamma Exposure)",
+                       style={"fontWeight": "bold", "fontSize": "1.1rem"}),
+            _signal_badge(gex.signal,
+                          "BUY" if gex.signal > 10 else
+                          "SELL" if gex.signal < -10 else "NEUTRAL"),
+        ], style={"backgroundColor": "#161b22",
+                  "borderBottom": "1px solid #30363d"}),
+        dbc.CardBody([
+            html.Div([
+                html.Span("Gamma Flip: ", style={"color": "#8b949e"}),
+                html.Span(f"{gex.gamma_flip_level:.0f}",
+                          style={"fontWeight": "bold", "fontSize": "1.3rem",
+                                 "color": "white"}),
+                html.Span(f"  ({gex.distance_to_flip:+.0f}pts)",
+                          style={"color": regime_color, "fontWeight": "bold"}),
+            ]),
+            html.Div([
+                html.Span("Regime: ", style={"color": "#8b949e"}),
+                html.Span(gex.gamma_regime,
+                          style={"fontWeight": "bold", "color": regime_color}),
+            ], style={"marginTop": "6px"}),
+            html.P(gex.description,
+                   style={"fontSize": "0.85rem", "color": "#c9d1d9",
+                          "marginTop": "10px"}),
+            html.P("STALE DATA — waiting for refresh",
+                   style={"fontSize": "0.8rem", "color": "#f0ad4e"})
+            if gex.stale else html.Span(),
+        ]),
+    ], style={
+        "backgroundColor": "#0d1117",
+        "border": "1px solid #30363d",
+        "marginBottom": "12px",
+    })
+
+
+def _seasonality_card(snap: FlowSnapshot) -> dbc.Card:
+    """Card for calendar seasonality."""
+    seasonal = snap.seasonality
+    if seasonal is None:
+        return _flow_card("Seasonality", 0, "NEUTRAL", "Loading...", "")
+
+    return _flow_card(
+        "Seasonality",
+        seasonal.signal,
+        seasonal.bias_direction,
+        seasonal.description,
+        f"Active: {', '.join(seasonal.active_effects)}"
+        if seasonal.active_effects else "No strong seasonal effects today"
+    )
 
 
 def _summary_card(snap: FlowSnapshot) -> dbc.Card:
     """Summary of all active flows and net signal."""
     rows = []
     flow_items = [
+        ("GEX", snap.gex.signal if snap.gex and not snap.gex.stale else 0,
+         snap.gex.gamma_regime if snap.gex and not snap.gex.stale else "N/A"),
         ("Rebalance", snap.rebalance.signal, snap.rebalance.flow_direction),
         ("CTA", snap.cta.signal, snap.cta.flow_direction),
         ("Vol-Control", snap.vol_control.signal, snap.vol_control.flow_direction),
@@ -326,6 +415,8 @@ def _summary_card(snap: FlowSnapshot) -> dbc.Card:
          "BUY" if snap.buyback.signal > 10 else "SELL" if snap.buyback.signal < -10 else "NEUTRAL"),
         ("OpEx", snap.opex.magnitude * (1 if snap.opex.phase != "PIN" else -1),
          snap.opex.phase),
+        ("Seasonal", snap.seasonality.signal if snap.seasonality else 0,
+         snap.seasonality.bias_direction if snap.seasonality else "N/A"),
     ]
 
     for name, sig, direction in flow_items:
@@ -421,6 +512,103 @@ def _build_cta_table(snap: FlowSnapshot) -> html.Div:
                     html.Th("Level", style={"color": "#8b949e", "textAlign": "right"}),
                     html.Th("Distance", style={"color": "#8b949e", "textAlign": "right"}),
                     html.Th("Status", style={"color": "#8b949e", "textAlign": "center"}),
+                ])),
+                html.Tbody(rows),
+            ], style={"width": "100%"}),
+        ]),
+    ], style={
+        "backgroundColor": "#0d1117",
+        "border": "1px solid #30363d",
+        "marginTop": "12px",
+    })
+
+
+def _build_gex_table(snap: FlowSnapshot) -> html.Div:
+    """Detail table showing top GEX strikes."""
+    if snap.gex is None or not snap.gex.top_strikes:
+        return html.Div()
+
+    rows = []
+    for s in snap.gex.top_strikes:
+        net_color = "#00c853" if s.net_gex > 0 else "#ff1744"
+        rows.append(html.Tr([
+            html.Td(f"{s.strike:.0f}", style={"color": "white", "fontWeight": "bold"}),
+            html.Td(f"{s.call_oi:,}", style={"color": "#66bb6a", "textAlign": "right"}),
+            html.Td(f"{s.put_oi:,}", style={"color": "#ef5350", "textAlign": "right"}),
+            html.Td(f"{s.call_gex:,.0f}", style={"color": "#66bb6a", "textAlign": "right"}),
+            html.Td(f"{s.put_gex:,.0f}", style={"color": "#ef5350", "textAlign": "right"}),
+            html.Td(f"{s.net_gex:+,.0f}", style={"color": net_color,
+                                                    "textAlign": "right",
+                                                    "fontWeight": "bold"}),
+        ]))
+
+    return dbc.Card([
+        dbc.CardHeader([
+            html.Span("GEX by Strike (Top 5)",
+                       style={"fontWeight": "bold", "fontSize": "1rem"}),
+            html.Span(f"  Flip: {snap.gex.gamma_flip_level:.0f}",
+                       style={"color": "#ffc107", "fontSize": "0.9rem",
+                              "marginLeft": "12px"}),
+        ], style={"backgroundColor": "#161b22",
+                  "borderBottom": "1px solid #30363d"}),
+        dbc.CardBody([
+            html.Table([
+                html.Thead(html.Tr([
+                    html.Th("Strike", style={"color": "#8b949e"}),
+                    html.Th("Call OI", style={"color": "#8b949e", "textAlign": "right"}),
+                    html.Th("Put OI", style={"color": "#8b949e", "textAlign": "right"}),
+                    html.Th("Call GEX", style={"color": "#8b949e", "textAlign": "right"}),
+                    html.Th("Put GEX", style={"color": "#8b949e", "textAlign": "right"}),
+                    html.Th("Net GEX", style={"color": "#8b949e", "textAlign": "right"}),
+                ])),
+                html.Tbody(rows),
+            ], style={"width": "100%"}),
+        ]),
+    ], style={
+        "backgroundColor": "#0d1117",
+        "border": "1px solid #30363d",
+        "marginTop": "12px",
+    })
+
+
+def _build_seasonal_table(snap: FlowSnapshot) -> html.Div:
+    """Detail table showing all seasonal effects."""
+    if snap.seasonality is None:
+        return html.Div()
+
+    rows = []
+    for e in snap.seasonality.effects:
+        color = "#78909c"
+        if e.active and e.bias > 0:
+            color = "#00c853"
+        elif e.active and e.bias < 0:
+            color = "#ff1744"
+
+        rows.append(html.Tr([
+            html.Td(e.name, style={"color": "#c9d1d9", "fontWeight": "bold"}),
+            html.Td(f"{e.bias:+.1f}", style={"color": color, "textAlign": "right",
+                                               "fontWeight": "bold"}),
+            html.Td("ACTIVE" if e.active else "inactive",
+                     style={"color": color if e.active else "#555",
+                            "textAlign": "center",
+                            "fontWeight": "bold" if e.active else "normal"}),
+            html.Td(e.description, style={"color": "#8b949e",
+                                           "fontSize": "0.8rem"}),
+        ]))
+
+    return dbc.Card([
+        dbc.CardHeader(
+            html.Span("Seasonal Effects",
+                       style={"fontWeight": "bold", "fontSize": "1rem"}),
+            style={"backgroundColor": "#161b22",
+                   "borderBottom": "1px solid #30363d"}),
+        dbc.CardBody([
+            html.Table([
+                html.Thead(html.Tr([
+                    html.Th("Effect", style={"color": "#8b949e"}),
+                    html.Th("Bias", style={"color": "#8b949e", "textAlign": "right"}),
+                    html.Th("Status", style={"color": "#8b949e", "textAlign": "center"}),
+                    html.Th("Detail", style={"color": "#8b949e"}),
                 ])),
                 html.Tbody(rows),
             ], style={"width": "100%"}),
