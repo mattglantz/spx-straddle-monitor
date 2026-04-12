@@ -13,7 +13,7 @@ ET = ZoneInfo("America/New_York")
 
 # ── IBKR Connection ─────────────────────────────────────────
 IBKR_HOST = "127.0.0.1"
-IBKR_PORT = 7497          # 7497 = paper, 7496 = live
+IBKR_PORT = 7496          # 7496 = live TWS, 7497 = paper
 IBKR_CLIENT_ID = 10       # separate from monitor (which uses 2)
 
 # ── Instrument ──────────────────────────────────────────────
