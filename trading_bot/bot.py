@@ -25,10 +25,10 @@ from typing import Optional
 from ib_async import IB, Index, ContFuture
 
 from trading_bot.config import (
-    IBKR_HOST, IBKR_PORT, IBKR_CLIENT_ID,
     ES_SYMBOL, ES_EXCHANGE, ES_POINT_VALUE, ET,
     BotConfig,
 )
+import trading_bot.config as cfg
 from trading_bot.data import MarketData
 from trading_bot.signals import SignalEngine, SignalSnapshot, Regime, event_name_today
 from trading_bot.strategy import Strategy, Action, Side
@@ -96,8 +96,8 @@ class TradingBot:
         """Single connection session."""
         self.ib = IB()
         try:
-            log.info(f"Connecting to IBKR {IBKR_HOST}:{IBKR_PORT} clientId={IBKR_CLIENT_ID}...")
-            await self.ib.connectAsync(IBKR_HOST, IBKR_PORT, clientId=IBKR_CLIENT_ID)
+            log.info(f"Connecting to IBKR {cfg.IBKR_HOST}:{cfg.IBKR_PORT} clientId={cfg.IBKR_CLIENT_ID}...")
+            await self.ib.connectAsync(cfg.IBKR_HOST, cfg.IBKR_PORT, clientId=cfg.IBKR_CLIENT_ID)
             log.info("Connected to IBKR.")
 
             self.ib.reqMarketDataType(1)  # live data for trading
