@@ -1,0 +1,241 @@
+"""
+Master Flow Aggregator.
+
+Combines all structural flow trackers into a single
+composite view with net directional bias and actionable signals.
+"""
+
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Optional
+
+from flow_module.config import FlowConfig, ET
+from flow_module.data import MarketDataStore
+from flow_module.rebalance import RebalanceTracker, RebalanceSignal
+from flow_module.opex import OpExTracker, OpExSignal
+from flow_module.cta import CTATracker, CTASignal
+from flow_module.vol_control import VolControlTracker, VolControlSignal
+from flow_module.buyback import BuybackTracker, BuybackSignal
+from flow_module.gex import GEXEstimator, GEXSignal
+from flow_module.seasonality import SeasonalityTracker, SeasonalitySignal
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class FlowSnapshot:
+    """Complete flow state at a point in time."""
+    timestamp: datetime
+    es_price: float
+    vix: float
+
+    # Individual flow signals
+    rebalance: RebalanceSignal
+    opex: OpExSignal
+    cta: CTASignal
+    vol_control: VolControlSignal
+    buyback: BuybackSignal
+    gex: Optional[GEXSignal] = None
+    seasonality: Optional[SeasonalitySignal] = None
+
+    # Composite
+    net_signal: float = 0.0          # -100 to +100 weighted composite
+    net_direction: str = "NEUTRAL"   # "BUY", "SELL", "NEUTRAL"
+    conviction: str = "none"         # "high", "moderate", "low", "none"
+    active_flows: list[str] = field(default_factory=list)
+    headline: str = ""               # one-line summary for dashboard
+
+
+class FlowAggregator:
+    """
+    Runs all flow trackers and produces a weighted composite signal.
+
+    IMPORTANT: Only active flows get weight. A flow that returns ~0
+    (e.g., pension rebalancing mid-month) is excluded from the composite
+    entirely — its weight is redistributed to the flows that ARE active.
+    This prevents dead signals from diluting live ones.
+
+    Base importance when active (used for redistribution):
+    - Rebalancing: 3.0 (trillions in AUM, very predictable timing)
+    - Vol Control:  2.5 (hundreds of billions, mechanical)
+    - CTA:          2.0 (hundreds of billions, trigger-based)
+    - Buyback:      1.5 (consistent but spread out)
+    """
+
+    # Relative importance — only used to distribute weight among ACTIVE flows
+    IMPORTANCE = {
+        "rebalance": 3.0,
+        "vol_control": 2.5,
+        "cta": 2.0,
+        "buyback": 1.5,
+        "gex": 3.5,          # highest — this is the most precise signal
+        "seasonality": 1.0,  # lowest — background bias, not a trade trigger
+    }
+
+    # A flow must exceed this absolute signal to be considered "active"
+    ACTIVE_THRESHOLD = 10.0
+
+    def __init__(self, cfg: FlowConfig):
+        self.cfg = cfg
+        self.rebalance = RebalanceTracker(cfg.rebalance)
+        self.opex = OpExTracker(cfg.opex)
+        self.cta = CTATracker(cfg.cta)
+        self.vol_control = VolControlTracker(cfg.vol_control)
+        self.buyback = BuybackTracker(cfg.buyback)
+        self.gex = GEXEstimator()
+        self.seasonality = SeasonalityTracker()
+
+    def evaluate(self, store: MarketDataStore) -> FlowSnapshot:
+        """Run all trackers and produce composite snapshot."""
+        now = datetime.now(ET)
+        price = store.live_price if store.live_price > 0 else store.last_close
+        vix = store.live_vix
+
+        # Run each tracker
+        closes = store.closes
+        dates = [b.date for b in store.daily_bars]
+
+        rebal_sig = self.rebalance.evaluate(closes, dates, price)
+        opex_sig = self.opex.evaluate()
+        cta_sig = self.cta.evaluate(store)
+        vol_sig = self.vol_control.evaluate(store)
+        buyback_sig = self.buyback.evaluate()
+        gex_sig = self.gex.get_signal(price)
+        seasonal_sig = self.seasonality.evaluate()
+
+        # Collect directional signals
+        # OpEx is non-directional (PIN/UNWIND) — used as a modifier only
+        all_signals = {
+            "rebalance": rebal_sig.signal,
+            "vol_control": vol_sig.signal,
+            "cta": cta_sig.signal,
+            "buyback": buyback_sig.signal,
+            "gex": gex_sig.signal if not gex_sig.stale else 0.0,
+            "seasonality": seasonal_sig.signal,
+        }
+
+        # Only flows with |signal| above threshold participate in composite
+        active_signals = {
+            name: sig for name, sig in all_signals.items()
+            if abs(sig) >= self.ACTIVE_THRESHOLD
+        }
+
+        if active_signals:
+            # Distribute weight proportionally among active flows only
+            total_importance = sum(self.IMPORTANCE[n] for n in active_signals)
+            weighted_sum = sum(
+                sig * (self.IMPORTANCE[name] / total_importance)
+                for name, sig in active_signals.items()
+            )
+        else:
+            weighted_sum = 0.0
+
+        # OpEx modifier: during UNWIND phase, amplify signals (trends run further)
+        # During PIN phase, dampen signals (mean-reversion dominates)
+        if opex_sig.phase == "UNWIND":
+            weighted_sum *= 1.2
+        elif opex_sig.phase == "PIN":
+            weighted_sum *= 0.7
+
+        net_signal = max(min(round(weighted_sum, 1), 100.0), -100.0)
+
+        # Determine direction and conviction
+        if net_signal > 15:
+            net_direction = "BUY"
+        elif net_signal < -15:
+            net_direction = "SELL"
+        else:
+            net_direction = "NEUTRAL"
+
+        conviction = self._classify_conviction(net_signal, active_signals)
+
+        # Which flows are active?
+        active = []
+        if abs(rebal_sig.signal) > 10:
+            active.append(f"Rebalance ({rebal_sig.flow_direction})")
+        if opex_sig.phase != "NEUTRAL":
+            active.append(f"OpEx ({opex_sig.phase})")
+        if abs(cta_sig.signal) > 10:
+            active.append(f"CTA ({cta_sig.flow_direction})")
+        if abs(vol_sig.signal) > 10:
+            active.append(f"Vol-Control ({vol_sig.flow_direction})")
+        if abs(buyback_sig.signal) > 10:
+            active.append(f"Buyback ({buyback_sig.blackout_phase})")
+        if not gex_sig.stale and abs(gex_sig.signal) > 10:
+            active.append(f"GEX ({gex_sig.gamma_regime})")
+        if abs(seasonal_sig.signal) > 10:
+            active.append(f"Seasonal ({seasonal_sig.bias_direction})")
+
+        headline = self._build_headline(
+            net_signal, net_direction, conviction, active, price, vix,
+            gex_sig.gamma_flip_level if not gex_sig.stale else 0)
+
+        snapshot = FlowSnapshot(
+            timestamp=now,
+            es_price=price,
+            vix=vix,
+            rebalance=rebal_sig,
+            opex=opex_sig,
+            cta=cta_sig,
+            vol_control=vol_sig,
+            buyback=buyback_sig,
+            gex=gex_sig,
+            seasonality=seasonal_sig,
+            net_signal=net_signal,
+            net_direction=net_direction,
+            conviction=conviction,
+            active_flows=active,
+            headline=headline,
+        )
+
+        active_names = list(active_signals.keys()) if active_signals else ["none"]
+        gex_info = (f"gex={gex_sig.signal:+.0f}(flip={gex_sig.gamma_flip_level:.0f})"
+                    if not gex_sig.stale else "gex=N/A")
+        log.info(
+            f"Flow Snapshot: net={net_signal:+.0f} ({net_direction}) "
+            f"conviction={conviction} | "
+            f"rebal={rebal_sig.signal:+.0f} cta={cta_sig.signal:+.0f} "
+            f"vol={vol_sig.signal:+.0f} buyback={buyback_sig.signal:+.0f} "
+            f"{gex_info} seasonal={seasonal_sig.signal:+.0f} "
+            f"opex={opex_sig.phase} | "
+            f"weighted={','.join(active_names)}"
+        )
+
+        return snapshot
+
+    def _classify_conviction(self, net: float, signals: dict) -> str:
+        """
+        Conviction is high when multiple flows agree in direction.
+        """
+        abs_net = abs(net)
+        if abs_net < 15:
+            return "none"
+
+        # Count how many signals agree with net direction
+        agreeing = sum(
+            1 for sig in signals.values()
+            if (sig > 10 and net > 0) or (sig < -10 and net < 0)
+        )
+
+        if abs_net >= 50 and agreeing >= 3:
+            return "high"
+        elif abs_net >= 30 and agreeing >= 2:
+            return "moderate"
+        elif abs_net >= 15:
+            return "low"
+        return "none"
+
+    def _build_headline(self, net: float, direction: str, conviction: str,
+                        active: list[str], price: float, vix: float,
+                        gamma_flip: float = 0) -> str:
+        if not active:
+            return f"ES {price:.0f} | VIX {vix:.1f} | No significant structural flows active"
+
+        flip_str = f" | GEX Flip: {gamma_flip:.0f}" if gamma_flip > 0 else ""
+        flow_list = ", ".join(active)
+        return (
+            f"ES {price:.0f} | VIX {vix:.1f}{flip_str} | "
+            f"Net: {direction} {abs(net):.0f} ({conviction}) | "
+            f"Active: {flow_list}"
+        )
