@@ -224,12 +224,7 @@ class GEXEstimator:
                                   SPX_MULTIPLIER * spot * 0.01)
                 entry.net_gex = entry.call_gex + entry.put_gex
 
-            # Cancel any remaining data subscriptions
-            for ticker in tickers.values():
-                try:
-                    ib.cancelMktData(ticker.contract)
-                except Exception:
-                    pass
+            # Snapshot subscriptions auto-cancel — no need to cancel manually
 
             strike_list = sorted(gex_by_strike.values(), key=lambda s: s.strike)
             self._data.strike_data = strike_list
