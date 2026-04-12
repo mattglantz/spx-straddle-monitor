@@ -749,6 +749,9 @@ app.index_string = '''<!DOCTYPE html>
         letter-spacing: 0.8px !important;
     }
     .card { border-radius: 10px !important; }
+    a.card-link { text-decoration: none; display: block; border-radius: 10px; transition: border-color 0.2s, box-shadow 0.2s; }
+    a.card-link:hover > div { border-color: #58a6ff !important; box-shadow: 0 0 12px rgba(88,166,255,0.15); }
+    a.card-link > div { cursor: pointer; }
     ::-webkit-scrollbar { width: 8px; height: 8px; }
     ::-webkit-scrollbar-track { background: #0d1117; }
     ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
@@ -849,32 +852,38 @@ app.layout = dbc.Container([
     # Info Cards Row
     dbc.Row([
         # Spot Price + Day Change
-        dbc.Col(html.Div([
-            html.Div("SPX SPOT", style=CARD_LABEL),
-            html.Div(id="spot-display", style={**CARD_VALUE, "fontSize": "36px", "color": "#3fb950"}),
-            html.Div(id="session-move-display",
-                     style={**CARD_VALUE, "fontSize": "18px", "marginTop": "4px"}),
-            html.Div(id="mode-display", style={"fontSize": "12px", "color": "#484f58",
-                                                 "fontFamily": "JetBrains Mono, monospace"}),
-            html.Div(id="session-open-display",
-                     style={"fontSize": "12px", "color": "#484f58",
-                            "fontFamily": "JetBrains Mono, monospace"}),
-        ], style={**CARD_STYLE, "padding": "16px 20px"}), width=3),
+        dbc.Col(html.A([
+            html.Div([
+                html.Div("SPX SPOT", style=CARD_LABEL),
+                html.Div(id="spot-display", style={**CARD_VALUE, "fontSize": "36px", "color": "#3fb950"}),
+                html.Div(id="session-move-display",
+                         style={**CARD_VALUE, "fontSize": "18px", "marginTop": "4px"}),
+                html.Div(id="mode-display", style={"fontSize": "12px", "color": "#484f58",
+                                                     "fontFamily": "JetBrains Mono, monospace"}),
+                html.Div(id="session-open-display",
+                         style={"fontSize": "12px", "color": "#484f58",
+                                "fontFamily": "JetBrains Mono, monospace"}),
+            ], style={**CARD_STYLE, "padding": "16px 20px"}),
+        ], href="https://www.cboe.com/delayed_quotes/spx", target="_blank", className="card-link"), width=3),
 
         # Strike
-        dbc.Col(html.Div([
-            html.Div("ACTIVE STRIKE", style=CARD_LABEL),
-            html.Div(id="strike-display", style={**CARD_VALUE, "fontSize": "32px", "color": "#58a6ff"}),
-        ], style={**CARD_STYLE, "padding": "16px 20px"}), width=2),
+        dbc.Col(html.A([
+            html.Div([
+                html.Div("ACTIVE STRIKE", style=CARD_LABEL),
+                html.Div(id="strike-display", style={**CARD_VALUE, "fontSize": "32px", "color": "#58a6ff"}),
+            ], style={**CARD_STYLE, "padding": "16px 20px"}),
+        ], href="https://www.cboe.com/delayed_quotes/spx/quote_table", target="_blank", className="card-link"), width=2),
 
         # VIX
-        dbc.Col(html.Div([
-            html.Div("VIX", style=CARD_LABEL),
-            html.Div(id="vix-display",
-                     style={**CARD_VALUE, "fontSize": "32px"}),
-            html.Div(id="vix-change-display",
-                     style={**CARD_VALUE, "fontSize": "18px", "marginTop": "4px"}),
-        ], style={**CARD_STYLE, "padding": "16px 20px"}), width=3),
+        dbc.Col(html.A([
+            html.Div([
+                html.Div("VIX", style=CARD_LABEL),
+                html.Div(id="vix-display",
+                         style={**CARD_VALUE, "fontSize": "32px"}),
+                html.Div(id="vix-change-display",
+                         style={**CARD_VALUE, "fontSize": "18px", "marginTop": "4px"}),
+            ], style={**CARD_STYLE, "padding": "16px 20px"}),
+        ], href="https://www.cboe.com/delayed_quotes/vix", target="_blank", className="card-link"), width=3),
 
         # Status
         dbc.Col(html.Div([
